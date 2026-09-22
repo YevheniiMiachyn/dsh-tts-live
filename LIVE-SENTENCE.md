@@ -199,3 +199,47 @@ network, no audio.
 5. **No mid-sentence clause cutting.** Only sentence boundaries (plus the
    over-long force-cut) start audio; a reply whose first sentence is 200
    characters long waits for it.
+
+## Hook provenance (verified against dsh 0.1.5-rc.2)
+
+| Fact | Evidence |
+|---|---|
+| one frame per raw chunk, emitted **live** | `dsh-agent-loop/lib/index.js:1031-1043` — `live.push(chunk)` runs inside `for await (const chunk of stream)` |
+| a chunk frame carries the raw `StreamChunk` | `dsh-agent-loop/lib/index.js:402-416` (`AssistantStreamAttempt.push`) |
+| `text-delta` is incremental, not cumulative | `dsh-llm/lib/types/assembler.js:46-52` (`partial.text += chunk.text`) |
+| listener signature is one payload `{ frame, agent }` | `dsh-agent/lib/index.js:209-213` (`agentEvents` fuses `agent` into the payload); first-party root-level listeners destructure exactly it — `dsh-api-session-controller`, `dsh-headless` both do `ctx.on('agent/assistant-stream', ({ agent, frame }) => …)` |
+| the event is scope-routed by `args[0].agent` | `dsh-scope/lib/invariant.js:10` |
+| root-level (non-agent-scoped) listeners receive it | the two packages above, plus `dsh-tts`'s existing `session/event` listener |
+| reasoning vs visible text vs tool calls are distinct chunk types | `dsh-llm/lib/types/types.d.ts:359-389` (`StreamChunk` union) |
+
+## Scratch wiring
+
+Profile: `C:\Users\Jenya\.dsh\profiles\voicelive` — a new profile, so the
+running `web` profile and the npm copy of dsh-tts are untouched.
+
+```
+voicelive/package.json   "@goodandready/dsh-tts": "link:../../../dsh-tts-local"
+                          (link:, not file:, so this fork is live-editable)
+voicelive/cordis.patch.yml   copied from scratch: whisper + theme (voice dictation)
+settings-voicelive.yaml      own copy of the voice settings + the live keys below
+ollama-voicelive.cordis.yml  --patch overlay: that settings file, port 3081, akeno preset
+```
+
+```sh
+dsh --profile voicelive --patch C:\Users\Jenya\.ollama\launch\dsh\ollama-voicelive.cordis.yml
+# http://127.0.0.1:3081
+curl http://127.0.0.1:3081/dsh-tts/status     # live.enabled must be true, live.pollMs 150
+```
+
+The settings file carries `liveSentenceStreaming: true` plus the six knobs and
+keeps `streamingEnabled: false`, `customBaseUrl: http://127.0.0.1:18080/v1`,
+`chain: [custom/qwen3-tts-akeno/akeno]`, `speakReplies: true`. Its
+`agent-default-model` points at `unsloth/Qwen3.8-27B-GGUF` with
+`reasoningEffort: low` (the production voice settings file still names the cloud
+model, which must not be inherited by this profile).
+
+The fork needs the harness's own `@deepseek-ai/*` packages at their real paths so
+its peer imports (`defineTool`, `credentialRef`, schemastery) are the *same*
+module instances the harness loaded. `C:\Users\Jenya\dsh-tts-local\node_modules\@deepseek-ai`
+is a junction to the installation's copy for exactly that reason; it is
+git-ignored and is also what lets the tests import `lib/index.js` directly.
