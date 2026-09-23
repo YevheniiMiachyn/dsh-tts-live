@@ -72,3 +72,82 @@ see the defect log in `LIVE-SENTENCE.md`. Regression coverage:
 `test/dup-publish.test.mjs` (24 tests, including two integration reproducers that
 drive the real plugin with a held-open `fetch`, and a publication-accounting check
 against `/dsh-tts/stats`).
+
+## Commit 5 — barge-in silences the rest of the turn (0.4.16-local.4)
+
+### The defect
+
+The user talks over the assistant by pressing the microphone, expecting it to stop.
+It stopped *sometimes*: reliably for a reply that had already finished streaming, and
+not for a longer one still being generated.
+
+Aborting in-flight synthesis and dropping the queued slots stops speech **now**. It
+does not stop speech **resuming**. The agent loop keeps emitting frames for the same
+turn after the barge-in, and every sentence completed afterwards was flushed, claimed
+and synthesized as usual — the reply picked up again a moment later, mid-thought.
+
+Three separate holes fed the same symptom:
+
+| hole | effect |
+|---|---|
+| `abortAll` aborted controllers and dropped the queue but left the cursor alive | the next completed sentence of the same turn was spoken |
+| nothing ever dispatched `dsh:tts:start` / `dsh:tts:stop` | dsh-voice *listened* for both and nothing sent them, so its `isTtsSpeaking` was permanently false and its own barge-in path was dead code |
+| the host barge-in POST was gated on `player.liveEnabled` | with live sentence streaming off, a piece still synthesizing settled into the queue and was collected by the next poll |
+
+### `lib/live.js` — per-turn silence
+
+`abortAll(sid)` now also records `${sid}|${turn}` in `mutedTurns`, for every live
+cursor (via `cursor.turn`) **and** for the turn currently streaming (tracked in
+`currentTurn` from each `start` frame). The second source matters: a barge-in can land
+before the first sentence was ever flushed, or between two steps of a multi-step turn,
+when there is no piece to abort yet but the turn is about to speak.
+
+`speak()` returns early for a muted turn. This is the whole mechanism, and it is safe
+precisely because `drainPieces` **claims** `raw` before returning pieces: a silenced
+sentence is still owned by the step, so the settlement reconcile can never read it as
+unsaid text and speak it from the durable path afterwards. The claim advances; only
+the audio is suppressed.
+
+`onSettledMessage()` checks the mute **first**. The cursor can hold zero pieces when
+the barge-in beat the first sentence, and the existing `pieces === 0` fallback would
+have handed the *entire* message back to be spoken — the loudest possible version of
+the talk-over. A silenced settlement marks its cursor settled (so a duplicate
+settlement event still cannot fall through) and releases its own mute entry.
+
+Mutes are **not** pruned by turn order. A settlement can arrive after the next turn
+has already started streaming — the ordering a fast follow-up produces — and clearing
+the mute there would read the silenced remainder aloud over the new reply. Turn numbers
+only increase for a session, so a stale entry can never silence a later turn; the map
+is bounded by `MUTE_CAP = 64` instead.
+
+### `lib/client-src/20-player.js` — playback state and one barge-in path
+
+- `announceSpeech(on)` dispatches `dsh:tts:start` / `dsh:tts:stop` on edges only.
+  Started from a successful `audio.play()`, ended when the queue drains and nothing is
+  playing, and on `stopPlayback()`. dsh-voice's `isTtsSpeaking` is now truthful.
+- `bargeInNow()` holds the single hard-stop implementation, and the `/dsh-tts/bargein`
+  POST is no longer gated on live mode: the durable path has a pending queue too.
+- `dsh:tts:cancel` is now **listened** for as well as dispatched. It is authoritative —
+  the voice plugin has already decided that the user talking wins, so it is not
+  re-gated on the TTS-side `bargeIn` setting, which still governs the implicit
+  `dsh-voice:speaking` path.
+
+### Deployment requirement
+
+`isTtsSpeaking` being truthful activates dsh-voice's turn-taking gate. With the plugin
+defaults (`bargeIn: false`, `gatedTurnTaking: true`) pressing the microphone during
+speech now refuses with *Assistant speaking (gated mode)* instead of barging in. The
+profile therefore sets `bargeIn: true`; `micHoldMs: 0` remains the way to release the
+device immediately.
+
+### Regression coverage
+
+`test/bargein.test.mjs` (12 tests) drives the engine with the exact window this defect
+lived in — text arriving after the barge-in — and asserts the piece that was already
+audible stays audible, later text is claimed but never spoken in both the `pieces > 0`
+and `pieces === 0` shapes, later steps and later frames of the interrupted turn stay
+silent, a duplicate settlement cannot resurrect it, a *following* turn speaks again,
+and the mute map stays capped. `test/bargein-wiring.test.mjs` (4 tests) reads the
+**built** `lib/client.js` for the client half so a rebase cannot quietly drop it; every
+assertion was negative-controlled against the pre-patch bundle (6 of 7 checks fail
+there, 7 of 7 pass here).
