@@ -262,19 +262,22 @@ messages exactly as upstream does.
 
 ## Scratch wiring
 
-Profile: `C:\Users\Jenya\.dsh\profiles\voicelive` — a new profile, so the
-running `web` profile and the npm copy of dsh-tts are untouched.
+Profile: a dedicated scratch DSH profile (e.g. `<dsh-home>/profiles/voicelive`)
+— a new profile, so the normal `web` profile and the npm copy of dsh-tts are
+untouched.
 
 ```
-voicelive/package.json   "@goodandready/dsh-tts": "link:../../../dsh-tts-local"
-                          (link:, not file:, so this fork is live-editable)
+voicelive/package.json   "@goodandready/dsh-tts": "link:../../../dsh-tts"
+                          (link:, not file:, so this fork is live-editable;
+                           scratch profiles only — production consumes a
+                           frozen file: tarball)
 voicelive/cordis.patch.yml   copied from scratch: whisper + theme (voice dictation)
 settings-voicelive.yaml      own copy of the voice settings + the live keys below
 ollama-voicelive.cordis.yml  --patch overlay: that settings file, port 3081, akeno preset
 ```
 
 ```sh
-dsh --profile voicelive --patch C:\Users\Jenya\.ollama\launch\dsh\ollama-voicelive.cordis.yml
+dsh --profile voicelive --patch <patch-dir>/ollama-voicelive.cordis.yml
 # http://127.0.0.1:3081
 curl http://127.0.0.1:3081/dsh-tts/status     # live.enabled must be true, live.pollMs 150
 ```
@@ -288,8 +291,8 @@ model, which must not be inherited by this profile).
 
 The fork needs the harness's own `@deepseek-ai/*` packages at their real paths so
 its peer imports (`defineTool`, `credentialRef`, schemastery) are the *same*
-module instances the harness loaded. `C:\Users\Jenya\dsh-tts-local\node_modules\@deepseek-ai`
-is a junction to the installation's copy for exactly that reason; it is
+module instances the harness loaded. A `node_modules/@deepseek-ai` junction to
+the installation's copy exists in the checkout for exactly that reason; it is
 git-ignored and is also what lets the tests import `lib/index.js` directly.
 
 ## Defect log

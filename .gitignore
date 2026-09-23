@@ -2,3 +2,39 @@ node_modules/
 *.bak
 *.before-*
 
+# Local scratch / verification output
+*.log
+*.tmp
+*.tgz
+*.tar.gz
+coverage/
+dist/
+
+# Never commit audio, model weights, databases or captured session logs
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.gguf
+*.ggml
+*.onnx
+*.safetensors
+*.bin
+*.pt
+*.db
+*.sqlite
+*.jsonl
+*.zst
+
+# Credentials and local environment
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

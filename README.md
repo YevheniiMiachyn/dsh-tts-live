@@ -35,6 +35,122 @@
 
 ---
 
+## 🍴 This is a fork of `@goodandready/dsh-tts`
+
+| | |
+|---|---|
+| **Upstream project** | [`GooDAnDReaDY/dsh-tts`](https://github.com/GooDAnDReaDY/dsh-tts) |
+| **Upstream author** | [GooDAnDReaDY](https://github.com/GooDAnDReaDY) — npm [`@goodandready/dsh-tts`](https://www.npmjs.com/package/@goodandready/dsh-tts) |
+| **Forked from** | upstream `0.4.16` (npm tarball shasum `0516c0c9613efe5ca666738179ba34570802b92e`) |
+| **This fork's version** | `0.4.16-local.3` — release tag [`v0.4.16-live.1`](../../releases) |
+| **License** | MIT — upstream copyright preserved verbatim, see [`LICENSE`](LICENSE) |
+
+> [!IMPORTANT]
+> **This is not the upstream project.** Anything about the base plugin — provider
+> chains, the settings UI, cloud backends, localization — belongs
+> [upstream](https://github.com/GooDAnDReaDY/dsh-tts/issues). Issues and pull
+> requests about **live sentence streaming** belong here. This fork does **not**
+> publish to npm; install it from this repository.
+
+### Why this fork exists
+
+Upstream speaks a reply only once the assistant message has settled, and
+`speakAsItGoes` is **message-level, not token-level**: every step of a turn is one
+message, so with a local model the first audible piece waits for the *entire*
+assistant message — on step 1, including a whole thinking pass. On a local
+GPU-resident stack that wait is the dominant part of "the voice feels slow".
+
+This fork adds an **opt-in, sentence-level live path** that speaks each sentence
+the moment the model finishes producing it, plus a small set of production fixes
+for local OpenAI-compatible TTS servers.
+
+It is deliberately conservative: the live path is **opt-in and off by default**,
+the durable settlement path stays the source of truth, `streamingEnabled` remains
+independent, and every upstream behaviour still works unchanged.
+
+### What this fork adds
+
+**Features**
+
+* **True sentence-level TTS** driven by the process-local
+  `agent/assistant-stream` event — the only genuinely token-level hook.
+* **First sentence can synthesize before `assistant/message` settlement**, so
+  speech starts while the model is still writing.
+* **Ordered sentence queue** — one piece per sentence, published in order, with
+  stable ids so the client cannot double-play or reorder audio.
+* **Explicit session / turn / step ownership** on every queued and settled piece.
+* **Durable-message reconciliation** — when the settled message arrives, already
+  spoken text is matched against it and only the unsaid tail is published.
+* **Multi-step / tool-call support** — reasoning and tool-call JSON are never
+  spoken, and a step whose live audio was already played is not re-spoken.
+* **Host-side barge-in cancellation** — `POST /dsh-tts/bargein` drops pending
+  audio and aborts in-flight synthesis for a session.
+* **Late-settle suppression** — a retried or re-settled step cannot resurrect
+  audio that was already dropped by a barge-in.
+* **Configurable live sentence thresholds** and **faster live pending polling**.
+
+**Configuration keys** (all under `dsh-tts:` in `settings.yaml`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `liveSentenceStreaming` | `false` | Master switch for the live sentence path |
+| `liveMinCharsFirst` | `12` | Minimum characters before the **first** sentence may flush |
+| `liveMinChars` | `48` | Minimum characters for subsequent flushes |
+| `liveMaxChars` | `0` | Hard cap per piece; `0` falls back to `sentenceChars` |
+| `livePollMs` | `150` | Pending-queue poll interval while speech is live |
+| `liveFlushOnToolCall` | `true` | Flush the unspoken remainder before a tool call |
+
+```yaml
+dsh-tts:
+  liveSentenceStreaming: true
+  liveMinCharsFirst: 12
+  liveMinChars: 48
+  liveMaxChars: 0
+  livePollMs: 150
+  liveFlushOnToolCall: true
+  streamingEnabled: false   # independent of live mode, and left false in the validated setup
+```
+
+> `streamingEnabled` (the upstream SSE/AudioWorklet path) stays **independent** —
+> live sentence streaming neither requires it nor turns it on. The validated
+> production configuration keeps it `false`.
+
+**Fixes carried over from local patches**
+
+* **Custom provider WAV request** — the `custom` provider asks for
+  `response_format: 'wav'` instead of `'mp3'`.
+* **`audio/wav` handling** — the returned mime type follows the requested format
+  (`key === 'custom' ? 'audio/wav' : 'audio/mpeg'`).
+* **Abort propagation fix** — a bare `abort` identifier meant the listener was
+  never attached, so caller cancellation never reached in-flight synthesis.
+* **Browser `SpeechSynthesis` fallback blocked** — the OS-voice fallback used to
+  speak provider failures out loud, masking real errors.
+* **Provider timeout raised to 120 s** — local TTS cold-start synthesis can
+  exceed the old 10 s cap, aborting work that would have succeeded.
+* **Duplicate live-tail publish fixed** — ownership now claims an exact raw text
+  range (`claimedEnd`) instead of a re-rendered join, so one synthesis can never
+  be published twice.
+
+See [`PATCHES.md`](PATCHES.md) for the per-patch ledger and
+[`LIVE-SENTENCE.md`](LIVE-SENTENCE.md) for the design notes and defect log.
+
+### Known limitations
+
+* **Shared-GPU contention.** The LLM and the local TTS engine compete for the
+  same GPU. Sentence-level streaming improves *scheduling* — speech starts
+  earlier — but it does not make the model or the TTS faster.
+* **It does not solve model TTFT.** Time-to-first-token is a property of the
+  model and hardware; live streaming only removes the wait *after* the first
+  sentence exists.
+* **Inline code can sound awkward.** With `skipCode: true` the sanitizer deletes
+  inline code spans, so a sentence built out of them can be spoken with gaps.
+  This is upstream behaviour on both the live and settled paths, but live mode
+  speaks more sentences so it is heard more often.
+* **Performance varies** by local model, TTS engine and GPU configuration. The
+  numbers quoted in the release notes come from one specific local setup.
+
+---
+
 ## ⚡ Overview
 
 **`dsh-tts`** provides robust, lifelike spoken voice synthesis for assistant replies in the **DeepSeek Harness** Web UI. When **Speak agent replies** is enabled, each finished assistant turn or real-time streaming chunk is synthesized on the host and streamed directly to the browser.
@@ -164,6 +280,16 @@ Before text reaches speech synthesizers, `dsh-tts` intelligently sanitizes and f
 
 ## 📦 Quick Installation
 
+**This fork** — install from a checkout of this repository (a `file:` dependency
+keeps the tested artifact frozen; avoid `link:` for production):
+
+```bash
+dsh plugin --profile web add file:/path/to/dsh-tts-<version>.tgz
+```
+
+**Upstream** — the published npm package, which does *not* contain the live
+sentence feature described above:
+
 ```bash
 dsh plugin --profile web add @goodandready/dsh-tts
 ```
@@ -230,4 +356,10 @@ Config-only (not in the card): `*KeyEnv` fields (`openaiKeyEnv`, `elevenlabsKeyE
 
 ## 📄 License
 
-MIT © [GooDAnDReaDY](https://github.com/GooDAnDReaDY)
+MIT © [GooDAnDReaDY](https://github.com/GooDAnDReaDY) — upstream author of
+`@goodandready/dsh-tts`.
+
+This fork preserves the upstream `LICENSE` and copyright notice verbatim. Fork
+modifications (live sentence streaming and the patch ledger described in
+[`PATCHES.md`](PATCHES.md)) are released under the same MIT terms. It is not
+affiliated with or endorsed by the upstream author.

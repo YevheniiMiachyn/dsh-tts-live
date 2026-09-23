@@ -2,27 +2,33 @@
 /**
  * Verify that every production patch is still in force in this fork.
  *
- * The running install at
- * `C:\Users\Jenya\.dsh\profiles\web\node_modules\@goodandready\dsh-tts`
- * carries five hand edits that exist in no published release. Porting them was
- * a byte-for-byte exercise (see the patch-layer commit); this script keeps them
- * honest afterwards, when the live sentence feature legitimately extends the
- * client bundle.
+ * A production install — the plugin directory inside a DSH profile, i.e.
+ * `<dsh-profile>/node_modules/@goodandready/dsh-tts` — carries five hand edits
+ * that exist in no published release. Porting them was a byte-for-byte exercise
+ * (see the patch-layer commit); this script keeps them honest afterwards, when
+ * the live sentence feature legitimately extends the client bundle.
  *
  * Two kinds of check:
  *   1. content invariants — holds for every patch, including the one that lives
  *      in client-src and is regenerated into lib/client.js;
- *   2. file parity — comment-normalized equality with the running install, for
- *      the two files the live feature does not touch.
+ *   2. file parity — comment-normalized equality with an installed copy, for
+ *      the two files the live feature does not touch. Skipped when no
+ *      installed copy is readable.
  *
  * Usage: node scripts/verify-parity.mjs [productionDir]
+ *        DSH_TTS_PROD_DIR=<installed plugin dir> node scripts/verify-parity.mjs
  */
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const prod = process.argv[2] || 'C:/Users/Jenya/.dsh/profiles/web/node_modules/@goodandready/dsh-tts'
+// Where the plugin is actually installed, e.g. a DSH profile's
+// node_modules/@goodandready/dsh-tts. Overridable by argument or environment.
+const prod =
+  process.argv[2] ||
+  process.env.DSH_TTS_PROD_DIR ||
+  path.join(root, 'node_modules', '@goodandready', 'dsh-tts')
 
 const read = async (rel, base = root) => readFile(path.join(base, rel), 'utf8').catch(() => undefined)
 

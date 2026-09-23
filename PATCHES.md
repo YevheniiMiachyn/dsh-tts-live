@@ -1,6 +1,8 @@
 # Local fork provenance and patch ledger
 
-Fork of **`@goodandready/dsh-tts` 0.4.16** maintained by/for the Jenya AI (Akeno) stack.
+Fork of **`@goodandready/dsh-tts` 0.4.16** (upstream:
+<https://github.com/GooDAnDReaDY/dsh-tts>, MIT), maintained for a private local
+DSH voice stack that speaks through a local Qwen TTS backend.
 
 ## Commit 1 — upstream verbatim
 
@@ -12,9 +14,9 @@ package. Upstream project: <https://github.com/GooDAnDReaDY/dsh-tts> (MIT).
 
 ## Commit 2 — production patch layer (parity with the running install)
 
-The production install at
-`C:\Users\Jenya\.dsh\profiles\web\node_modules\@goodandready\dsh-tts`
-carried five hand edits that exist in no published release. They are reproduced
+The production install — the plugin directory inside a DSH profile, i.e.
+`<dsh-profile>/node_modules/@goodandready/dsh-tts` — carried five hand edits that
+exist in no published release. They are reproduced
 here so the fork *is* the running system plus new work, never a behaviour change.
 
 Verified at this commit: with comment lines removed, `lib/client.js`,
