@@ -53,3 +53,20 @@ dsh-tts:
 ## Commit 3 — live sentence-level TTS flush (new work)
 
 See `LIVE-SENTENCE.md`.
+
+## Commit 4 — duplicate live-tail publish fix (0.4.16-local.3)
+
+`lib/live.js`: the ownership cursor now claims an exact raw range (`claimedEnd` /
+`spokenRaw = raw.slice(0, claimedEnd)`) instead of a re-rendered "pieces joined by
+one space" string; `reconcileRemainder` aligns on whitespace-normalized text before
+the raw common-prefix fallback; a settled step keeps its claim record and returns an
+empty remainder on a repeat settlement; a retried attempt drops the abandoned
+attempt's unclaimed tail and filters its echo of already-claimed text out of `raw`.
+
+`lib/index.js`: an empty settlement remainder never reserves a queue slot.
+
+Found by the production promotion smoke (`u6`/`u7`: one synthesis, two publications);
+see the defect log in `LIVE-SENTENCE.md`. Regression coverage:
+`test/dup-publish.test.mjs` (24 tests, including two integration reproducers that
+drive the real plugin with a held-open `fetch`, and a publication-accounting check
+against `/dsh-tts/stats`).

@@ -64,23 +64,59 @@ Keyed by `sessionId|turn|step` (the step's cursor) with an
 
 | Field | Meaning |
 |---|---|
-| `raw` | every visible character received for this step |
-| `cursor` | offset of the first character not yet spoken or discarded |
-| `spokenRaw` | text already handed to synthesis, in order |
+| `raw` | the step's text: what it already claimed, followed by the current attempt's new text |
+| `cursor` | offset of the first character not yet handed to the cutter |
+| `claimedEnd` | offset of the first character no piece has claimed yet |
+| `spokenRaw` | `raw.slice(0, claimedEnd)` — exactly what this step has claimed |
 | `pieces` | how many pieces were spoken (0 ⇒ durable path keeps ownership) |
 | `controllers` | abort controllers of in-flight synthesis for this step |
+| `echo` | retry echo filter `{ at, remaining }`, or null |
+| `settled` | the durable message for this step already reconciled |
 
-The cursor survives a retry of the same step: a second attempt reuses the step's
-`spokenRaw`, so a retry can never re-speak the first attempt's text.
+### The ownership invariant
+
+**Every raw visible range of one step is claimed exactly once**: spoken, or
+discarded by explicit policy (text that scrubs to nothing, an unterminated fence).
+A claimed range can never become "unspoken" again. The claim is recorded as an
+*offset* (`claimedEnd`) before anything is enqueued, so `spokenRaw` is always the
+exact substring of `raw` the step owns — never a re-rendered copy of it.
+
+That distinction is the whole defence:
+
+* `claimedEnd` advances where the cutter hands out a range, so a whitespace run at a
+  piece boundary (a paragraph break recorded as one space) cannot make claimed text
+  look unclaimed.
+* reconciliation aligns the claim with the durable message on whitespace-normalized
+  text before falling back to a raw common prefix, so a rendering difference alone
+  can never re-emit a spoken tail.
+* a step settles once; the record is kept and marked `settled`, so a repeated
+  settlement for the same step returns an empty remainder instead of replaying the
+  whole message, and late frames from a settled step speak nothing.
+
+`0.4.16-local.2` recorded the claim as "trimmed pieces joined by one space". A
+paragraph break at a piece boundary then made the claim differ from the durable
+message by exactly one character, the common-prefix fallback treated the
+already-spoken tail as unsaid, and the tail was published a second time — with a new
+queue id, byte-identical audio (the second submission was coalesced into the
+still-in-flight first synthesis) and a synthesis count one lower than the number of
+published pieces.
+
+The cursor survives a retry of the same step. On a new attempt the previous
+attempt's unclaimed tail is dropped (the retry regenerates it) and the retry's echo
+of already-claimed text is filtered out of `raw`, so the retry never re-speaks a
+prefix that was already heard and `raw` stays an exact prefix of the durable text.
 
 **Duplicate-speech policy** (the settled message must never replay the stream):
 
 | Live state when `assistant/message` settles | Action |
 |---|---|
-| no cursor, or `pieces === 0` | **fallback** — upstream speaks the whole message |
+| no cursor | **fallback** — upstream speaks the whole message |
+| cursor with `pieces === 0` | **fallback** — nothing was streamed for this step |
 | `durable.startsWith(spokenRaw)` | **remainder** — speak only the unsaid tail |
-| diverged (retry/other text) | **remainder via longest common prefix** + a warning; the already-spoken prefix is never repeated |
-| `turn/end` | cursor is dropped, so a later turn cannot inherit ownership |
+| equal after whitespace normalization | **remainder** — a paragraph break is not unspoken text |
+| genuinely diverged (retry/other text) | **remainder via longest common prefix** (normalized first) + a warning; the claimed prefix is never repeated |
+| already settled | **remainder `''`** — a step settles once |
+| `turn/end` | cursors are dropped, so a later turn cannot inherit ownership |
 
 ## Sentence boundary rules
 
@@ -166,8 +202,8 @@ messages exactly as upstream does.
 
 ## Tests
 
-`node --test test/live.test.mjs test/wiring.test.mjs` — 38 tests, no model, no
-network, no audio.
+`node --test test/live.test.mjs test/wiring.test.mjs test/dup-publish.test.mjs` —
+69 tests, no model, no network, no audio.
 
 * `test/live.test.mjs` — the 15 required cases plus boundary/min-fragment units:
   leading-space tokens, end-of-token punctuation, multi-sentence deltas, one
@@ -180,13 +216,25 @@ network, no audio.
   `/status` live block, a live delta reaching `/dsh-tts/pending` with the WAV
   patch intact, no replay at settlement, remainder spoken exactly once, fallback
   with live mode off, abort, barge-in, and the cache path.
+* `test/dup-publish.test.mjs` — the duplicate-publish defect: three deterministic
+  reproducers (the production fixture at the tool-call boundary, the same shape
+  with no tool call, and the raw-string alignment) plus a 17-case matrix
+  (callback orderings, empty tails, retry, barge-in, cross-step isolation,
+  legitimate repetition in two turns and in one reply) and a publication
+  accounting check against `/dsh-tts/stats`
+  (`publishedPieces <= synthesis results + cache hits`, exact for the held-fetch
+  fixture). The integration cases drive the real plugin with `globalThis.fetch`
+  held open, which is what makes the 9-syntheses/10-pieces signature
+  reproducible rather than intermittent.
 
 ## Known limitations
 
-1. **Durable-text prefix matching.** The remainder is computed by prefix/LCP
-   comparison of raw strings. Block re-joining (`\n` between text blocks) or a
-   retry that rewrites its opening can shorten the match; the code then speaks
-   the unsaid tail only and logs a warning. It never replays the prefix.
+1. **Durable-text prefix matching.** The remainder is computed by aligning the
+   claimed range against the durable text — exactly first, then with whitespace
+   runs collapsed, then by common prefix. A genuine rewrite (a retry that changes
+   its opening, blocks re-joined with a separator the stream never sent) can still
+   shorten the match; the code then speaks the unsaid tail only and logs a warning.
+   It never replays the claimed prefix.
 2. **A fence left open at settlement is dropped**, not summarized (the scrub
    regex cannot match it). Closed fences get the normal notice.
 3. **`speakAsItGoes: false` + live mode** is a mixed state: steps the live path
@@ -243,3 +291,44 @@ its peer imports (`defineTool`, `credentialRef`, schemastery) are the *same*
 module instances the harness loaded. `C:\Users\Jenya\dsh-tts-local\node_modules\@deepseek-ai`
 is a junction to the installation's copy for exactly that reason; it is
 git-ignored and is also what lets the tests import `lib/index.js` directly.
+
+## Defect log
+
+### 0.4.16-local.3 — duplicate publish of a live tail (fixed)
+
+Found by the production promotion smoke test: turn 25 step 2 published ids `u6` and
+`u7` with identical text (94 chars, `b6260eaaa6e1`), identical audio
+(`57104318fa3f`, 257 324 B) and identical `tookMs` (3806) — while `/dsh-tts/stats`
+reported 9 syntheses for 10 published pieces, i.e. **one synthesis result was
+published twice**. The client's dedupe is keyed on `item.id` alone, so both ids were
+playable.
+
+Cause, proven against the recorded session rather than inferred:
+
+* `drainPieces` builds `spokenRaw` by trimming each piece and joining with one
+  space, so a paragraph break at a piece boundary is recorded as a single space.
+* the durable message keeps the `\n\n`. For turn 25 step 2 the claim was 514 chars
+  against a 515-char durable text: `durable.startsWith(spoken)` was **false** and
+  the longest common prefix ended at offset **419** — exactly the `\n\n`.
+* `durable.slice(419).trim()` is verbatim `u7`'s text, so the settlement re-published
+  the tail the tool-call boundary had already flushed.
+* the second submission was coalesced into the still-in-flight first synthesis
+  (`inFlightSyntheses`), which is why the audio and `tookMs` matched and why the
+  synthesis count stayed one lower than the publication count.
+
+The tool call was not the cause: the trigger is a whitespace run at a piece boundary.
+A two-paragraph reply with no tool call at all reproduced it (`REPRO A2`), and the
+model of the live path over the six recorded steps of that turn predicted the
+duplicate exactly where production produced it and nowhere else.
+
+The same investigation disproved the second suspected signature. The two "duplicate
+EMPTY pieces" `u11`/`u12` were two `kind: 'reserved'` rows still awaiting synthesis
+for step 6 — a reservation carries no `text` field, so comparing their empty text
+hashes produced a false duplicate. Step 6 published exactly two non-empty pieces.
+
+Fixed by making the claim an exact raw range (`claimedEnd`), aligning the claim with
+the durable text on whitespace-normalized text before the raw common-prefix
+fallback, settling a step once (`settled`), and filtering a retry's echo out of
+`raw`. `test/dup-publish.test.mjs` reproduces the original signature deterministically
+(no wall-clock dependence) and asserts the accounting bound
+`publishedPieces <= synthesis results + cache hits`.
