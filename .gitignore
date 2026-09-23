@@ -38,3 +38,7 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Timestamped local backups (<file>.bak-YYYYMMDD-HHMMSS-before-<reason>).
+# Verified redundant with HEAD before ignoring; the pre-change content is in git.
+*.bak-*
