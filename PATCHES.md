@@ -151,3 +151,48 @@ and the mute map stays capped. `test/bargein-wiring.test.mjs` (4 tests) reads th
 **built** `lib/client.js` for the client half so a rebase cannot quietly drop it; every
 assertion was negative-controlled against the pre-patch bundle (6 of 7 checks fail
 there, 7 of 7 pass here).
+
+## Commit 6 — inline code is spoken, not deleted (0.4.16-local.5)
+
+### The defect
+
+`stripForSpeech` replaced every inline `` `span` `` with a single space, so a reply
+containing identifiers was spoken with holes in it. Heard live, from a real reply:
+
+> Everything the restart needed to pick up is live: **now reads True** (it was false
+> before), the installed plugin **is ,** and the Akeno voice re-registered.
+
+Three things vanished from the audio — a setting name, a version, and the words that
+connected them — and the result still sounded like a sentence, which is why it read as
+a glitch rather than a bug. Deleting a fenced block is right; deleting an identifier
+inside prose is not.
+
+### `lib/text.js`
+
+- Inline spans are **unwrapped** (`` `x` `` → `x`) instead of deleted. `skipCode: false`
+  still leaves all markup untouched, and fenced blocks still become
+  *"code block, N lines"*.
+- `protectAbbreviations` gained one rule: a dot preceded by a letter or digit and
+  followed by a digit. The existing rule only covered digits-dot-digits, so it stopped
+  at `0.4.16` and left the last dot of `0.4.16-local.4` — the sentence cutter then
+  broke the identifier in two and spoke *"0.4.16-local. 4"*. No sentence boundary has a
+  digit immediately after the dot without a space, so this cannot swallow one.
+
+Both changes are on the shared `cleanText` path, so live sentence flush and the durable
+settlement cannot disagree about what a sentence says.
+
+### Regression coverage
+
+`test/spoken-code.test.mjs` (8 tests) asserts the invariant that matters — *no hole in
+the sentence* (`!/is\s+,/`) — rather than only the presence of the missing text, and it
+uses the real sentence that was heard garbled. It also pins the fenced-block notice
+line count, `skipCode: false`, several spans in one sentence, spans at sentence edges,
+and that an unwrapped version survives sentence splitting as one piece.
+
+Negative-controlled against `git show HEAD:lib/text.js`: the pre-patch module speaks the
+garbled sentence above and fails three of four checks; the patched module passes all
+four.
+
+`lib/client.js` is byte-identical to local.4 in this commit — the browser half is
+untouched, so the recorded client hash stays valid across both versions and only the
+host half changes.
