@@ -609,3 +609,85 @@ Full suite: **173 tests, 0 failures** (150 before this stage, 23 new).
 
 The transport is validated but the flag stays **off**: this stage's job was to
 produce the evidence and the switch, not to move the default.
+
+## 0.4.16-local.12 — the PCM stall guard abandoned healthy streams
+
+Found by the real-use soak (37 conversational turns, 60 spoken pieces) through the
+production-equivalent browser path. **9 of 60 pieces lost their audio (15 %)** while
+the host reported success for every one of them.
+
+### The defect
+
+The browser's stall guard in `lib/client-src/15-pcm-player.js` was a single deadline
+measured from a fixed origin:
+
+```js
+if (t - (s.tFirstChunk || s.tStart) > 5000) { /* declare stalled, release the stream */ }
+```
+
+That is an elapsed-time test, not an idleness test, so it abandoned two kinds of
+completely healthy stream:
+
+**1. A stream that had not produced its first chunk yet.** `pcm-start` is broadcast
+when the *request* is issued (`lib/pcm-stream.js` `open`, deliberately, "before any
+audio exists"), so the 5 s budget was spent waiting for the TTS server rather than
+watching for a dead stream. The server has one synthesis slot, so concurrent
+requests queue — measured directly, four simultaneous PCM requests get their first
+bytes at **75, 1978, 3746 and 5706 ms**, a ~1.9 s ladder. Any request past 5 s was
+released before it produced a single sample, and every chunk that then arrived was
+discarded as late. In the soak, pieces 34–37 waited 6 148–6 414 ms and pieces 47–50
+waited 27 622–28 240 ms; all eight were lost.
+
+**2. A long stream that was delivering steadily.** The deadline ran from the *first*
+chunk and was never renewed, so a piece whose total delivery exceeded ~5 s was cut
+off mid-playback. Measured: piece 32 began playing at 3 739 ms, its first chunk
+arrived at 87 ms, its last byte at 5 618 ms — and it was cut off at **5 103 ms**,
+which is 87 + 5 000 plus one sweep tick. A neighbouring piece survived only because
+its first byte was late enough (4 033 ms) to push the same deadline past its own
+last byte (7 898 ms). That is the signature of a rule keyed to the wrong timestamp:
+whether a piece survived depended on *how late it started*, not on whether it was
+arriving.
+
+Both modes increment `lateChunks` for every discarded chunk, which is what the soak
+showed climbing to 742.
+
+### The fix
+
+One rule becomes two, chosen by whether the stream has started producing:
+
+```js
+const STALL_MS = 5000           // no event for this long, once flowing
+const STALL_START_MS = 90000    // no first chunk at all (host timeout is 60 s)
+
+const stalled = s.tFirstChunk === null
+  ? (t - s.tStart) > STALL_START_MS
+  : (t - s.tLastEvent) > STALL_MS
+```
+
+`s.tLastEvent` is initialised in `newStream` and renewed in `handleChunk` (before
+framing validation, so a malformed chunk still counts as proof of life) and in
+`handleEnd`.
+
+The guard keeps its original job exactly — a stream that was flowing and then went
+silent for 5 s is still released, so it cannot wedge the queue behind it. What
+changes is that a stream waiting on the TTS server is no longer mistaken for a dead
+one, and the host's own 60 s provider timeout now always decides first (it answers
+with `pcm-abort`, which releases the stream correctly). `STALL_START_MS` exists only
+as a backstop for a host that vanished without sending one.
+
+### Evidence
+
+`test/pcm-stall-guard.test.mjs` — 9 tests. Both failure modes are reproduced
+numerically against the old rule and against the new one, so the test fails if the
+decision rule regresses rather than merely if a string changes. It also pins
+`STALL_START_MS > 60000` and asserts the one-shot expression is gone from both the
+source fragment and the built bundle.
+
+Full suite: **182 tests, 0 failures** (173 before this change).
+
+Was it the transport's fault at all? No. The slow first byte is server admission,
+and WAV is worse under the same load — the same probe measured four simultaneous
+*WAV* requests at 1 909–7 681 ms, because WAV cannot emit anything until the whole
+utterance is synthesised. PCM's first request in that group started at 75 ms. The
+defect was that PCM, which is fast enough to be exposed to a deep queue, then threw
+the result away.
