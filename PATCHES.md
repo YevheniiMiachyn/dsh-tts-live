@@ -369,4 +369,43 @@ provider and, with one chain entry, silence her), no leakage into an unnamed pro
 signature emptiness/stability. `lib/client.js` is byte-identical to local.7 — this is a host-only
 release.
 
+## `0.4.16-local.9` — the pending window may not evict a reserved row
+
+The live engine reserves a queue slot *before* synthesis, because the order the pieces are handed to
+the queue is the order they are spoken in (`lib/live.js:505`, "the order of these calls is the order
+of playback ... even when synthesis finishes out of order"). Upstream's window cap could break that
+promise on overflow: it evicted the oldest row, and when *every* row was still `reserved` it fell
+back to `pending.shift()` — taking the one kind of row the promise depends on. The evicted row's
+synthesis then settled into `settle()`'s missing-row path, which appended it at the **tail**.
+
+Measured live on 2026-09-23: 15 rows left the window inside ~2 s during one long reply with the
+synthesis error counter unchanged — nothing aborted, nothing failed — and the reply was heard as its
+first sentence followed by an unrelated later part. Raising `maxQueue` from the default 8 to 64 was
+the immediate mitigation and stopped the losses; this release fixes the window itself.
+
+### The change
+
+- **`lib/index.js` — `enqueue()`** evicts the oldest **settled** row and `break`s when only reserved
+  rows remain, so the cap becomes a soft bound: the window may exceed `maxQueue` by the number of
+  pieces currently synthesizing, and it shrinks again as they settle within `timeoutMs`. Growth is
+  bounded by in-flight synthesis; destroying a promise is not.
+- **`lib/index.js` — `insertInOrder()` / `idOrder()`** put a late-settling row back at its id's
+  position. Ids are `u<seq>` from one global counter (`index.js:544`), so position is recoverable;
+  a row whose id is not that shape still appends, which is upstream's behaviour. The cap is
+  deliberately *not* applied here — the row was already counted before it went missing, so restoring
+  it restores the previous size instead of growing it.
+- **`lib/index.js` — `settle()`** calls `insertInOrder()` where it used to call `enqueue()`.
+- **`lib/index.js` / `lib/routes.js`** count every eviction as `stats.queueEvictions`, log the 1st and
+  every 25th, expose it at `GET /dsh-tts/stats`, and reset it on `DELETE`. A dropped sentence can no
+  longer be invisible.
+
+### Regression coverage
+
+`test/queue-order.test.mjs` (3 tests), against a `fetch` stub whose responses are resolved by hand so
+the harness owns the order in which synthesis completes — which is the whole point. It asserts that
+an eight-sentence burst against `maxQueue: 3` keeps all eight reserved rows, in ascending id order,
+with zero evictions; that a window of settled rows is still bounded by the cap and *counts* what it
+drops; and that an over-cap enqueue drains settled rows only and never takes a reserved one. Full
+suite: 117 tests, 0 failures.
+
 
