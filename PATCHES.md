@@ -196,3 +196,86 @@ four.
 `lib/client.js` is byte-identical to local.4 in this commit — the browser half is
 untouched, so the recorded client hash stays valid across both versions and only the
 host half changes.
+
+## Commit 7 — silent mode (0.4.16-local.6)
+
+### What it is for
+
+The stack speaks every reply. That is right when somebody is at the machine and wrong
+when nobody is: the TTS model is loaded beside the primary model on the same single
+GPU, so every spoken sentence is inference spent talking to an empty room.
+
+Silent mode is the switch that says *nobody is listening right now*. It is turned on by
+the agent when the user says he is going out or wants quiet, and off again when he is
+back.
+
+### Why it is a runtime flag and not a setting
+
+It was first written as a `speechMuted` field in the plugin config, persisted to
+`settings.yaml`. That was wrong, and the correction is the point of this commit:
+
+| | persisted setting | runtime flag (shipped) |
+|---|---|---|
+| meaning | how the stack is configured to behave | who is in the room for the next hour |
+| after a restart | silently still mute — the stack looks broken | speech is enabled; the profile decides |
+| failure mode | a forgotten mute outlives the reason for it | cannot outlive the process |
+
+So the state lives in one closure variable inside `apply()`, is never written to
+`settings.yaml`, and cannot be stored, restored or inherited. Every start begins with
+speech enabled and the profile's own `speakReplies` deciding whether replies are spoken
+at all. (It is deliberately *not* the same switch as `speakReplies`: that one is the
+standing preference, this one is a moment in time.)
+
+### The gate
+
+`lib/index.js`, one predicate consulted at three points:
+
+- **`speakPiece()`** — the single choke point every automatic path funnels through: the
+  live sentence flush, speak-as-it-goes, the settled remainder, turn-end pieces and
+  announcements. The return sits before the queue slot is reserved and before the
+  provider chain is entered, so *muted* means **no request reached the TTS provider**,
+  not merely *no audio came out*. Callers keep their own bookkeeping, which is why
+  unmuting mid-reply speaks only what has not been said yet instead of replaying the
+  reply from the start.
+- **`announce()`** — approval and question announcements, including their chimes. An
+  announcement exists to attract attention; silent mode means there is nobody to attract.
+- **the `speak_text` tool** — declines with `muted: true` rather than synthesizing and
+  discarding the audio, and says why, so a caller unmutes deliberately instead of
+  quietly failing to be heard.
+
+### Control surface
+
+- **`set_speech_output`** — the agent-facing tool (`{ muted, reason }`; called with no
+  argument it only reports). Turning silent mode **on** also calls the barge-in path
+  (`liveEngine.abortAll()`), because *nobody is listening* has to be true of the
+  sentence being read right now, not only of the next one.
+- **`POST /dsh-tts/silence`** (`{ muted }`, `GET` reports) — for a script, a shortcut or
+  a future UI button, so the switch does not depend on an agent being in the loop.
+- **`/dsh-tts/status`** — `speechMuted` (the runtime state) and `speechSuppressed`
+  (`speechMuted || !speakReplies`), so "silent because nobody is here" and "reply speech
+  is configured off" cannot be mistaken for each other.
+
+One setter (`setSpeechMuted`) backs the tool and the route, so they cannot drift apart.
+
+### Client
+
+`lib/client-src/20-player.js`, one line: `player.enabled` now also requires
+`!meta.speechMuted`. The muted browser therefore behaves exactly as it already does
+when reply speech is unchecked — no `/dsh-tts/pending` poll and no playback — instead of
+introducing a new client state to reason about. No new UI: the switch is the agent's and
+the route's, and the standing preference stays where it was.
+
+### Regression coverage
+
+`test/silent-mode.test.mjs` (10 tests) drives the real plugin under a fake Cordis
+context with `fetch` stubbed, so `calls` is an exact record of every synthesis attempt.
+Every muted assertion has an unmuted control driving the same turn, because a gate that
+blocked everything — or a harness that never reached the synthesizer — must fail rather
+than pass quietly. It also asserts the schema does **not** contain `speechMuted` (the
+runtime-only invariant) and that two `apply()` calls get independent state.
+
+`test/wiring.test.mjs` needed one update: it asserted that the *last* registered tool was
+`speak_text`, which a second tool invalidates. It now asserts both tools by name.
+
+`verify-parity.mjs`: all production patches intact.
+

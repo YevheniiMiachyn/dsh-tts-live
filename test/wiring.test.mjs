@@ -31,6 +31,7 @@ function makeCtx() {
   const routes = new Map()
   const ctx = {
     _tool: null,
+    _tools: [],
     logger: { warn() {}, info() {}, error() {} },
     credentials: {
       resolve: async () => ({ value: 'local' }),
@@ -39,7 +40,7 @@ function makeCtx() {
       unset: async () => {},
     },
     llm: { stream: async function* () {} },
-    tools: { register: (tool) => { ctx._tool = tool } },
+    tools: { register: (tool) => { ctx._tool = tool; ctx._tools.push(tool) } },
     webServer: { register: (route) => { routes.set(route.path, route); return () => {} } },
     on: (event, cb) => {
       const arr = listeners.get(event) || []
@@ -160,7 +161,10 @@ test('plugin registers the live routes, the stream listener, and the tool', () =
   }
   assert.ok(listeners.has('agent/assistant-stream'), 'live stream listener is registered')
   assert.ok(listeners.has('session/event'), 'durable listener is registered')
-  assert.ok(ctx._tool && ctx._tool.name === 'speak_text', 'speak_text tool still registers')
+  // 0.4.16-local.6 adds a second tool (silent-mode control), so "the last tool
+  // registered" is no longer the interesting assertion — both are.
+  assert.deepEqual(ctx._tools.map((t) => t.name).sort(), ['set_speech_output', 'speak_text'],
+    'both tools register')
 })
 
 test('/status advertises live options so the browser can shorten its poll', async () => {
