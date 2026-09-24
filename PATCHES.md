@@ -691,3 +691,133 @@ and WAV is worse under the same load — the same probe measured four simultaneo
 utterance is synthesised. PCM's first request in that group started at 75 ms. The
 defect was that PCM, which is fast enough to be exposed to a deep queue, then threw
 the result away.
+
+## 0.4.16-local.13 — the dock's pause/stop controls vanished under PCM
+
+Reported from real use after the PCM promotion: *"the small buttons I could stop or
+pause your talking with are gone"*. Three connected defects, all from promoting a
+second playback path without teaching the rest of the client about it.
+
+### 1. Visibility — the dock never rendered for a PCM reply
+
+`lib/client-src/60-card-dock.js` decides whether to render at all from:
+
+```js
+const active = !!p.audio || p.queue.length > 0 || p.busy
+```
+
+All three terms are WAV-path evidence. An `<audio>` element and a queue of pending
+blobs exist only on the buffered path; progressive PCM hands blocks straight to the
+AudioContext and creates neither. So `active` was false for the entire duration of
+every PCM reply, the component returned `null`, and the pause (`❚❚`) and stop (`■`)
+controls were simply absent from the UI. `streamingEnabled` and `speakReplies` were
+both correct throughout, which is why nothing else looked wrong.
+
+The fix adds the two terms that answer the question for either transport:
+
+```js
+const active = !!p.audio || p.queue.length > 0 || p.busy || !!p.speaking || !!p.pcmPlaying
+```
+
+`speaking` is the transport-independent flag the plugin already maintained (and that
+dsh-voice's barge-in gate reads), so it is the honest term to add.
+`player.pcmPlaying` is new and covers the tail where all bytes are scheduled but the
+sound has not finished.
+
+### 2. Timing — `idle` fired when scheduling finished, not when speech did
+
+The PCM player emitted `idle` from the branch that is reached when every block has
+been **scheduled** (`s.ended && s.segSamples === 0`). The producer runs several times
+faster than real time, so a two-second piece is fully booked into the audio graph in
+a few hundred milliseconds and `idle` fired long before the listener heard the end.
+
+`announceSpeech(false)` hangs off that event, so `player.speaking` went false
+mid-sentence. That is the same flag dsh-voice's turn-taking gate reads
+(`isTtsSpeaking`), so the barge-in gate was reopening while she was still audibly
+talking — a second, quieter defect behind the visible one.
+
+Fixed by tracking the real end of audio and reporting it against the context clock:
+
+```js
+let playbackEndCtx = 0                              // ctx-time the last block ends
+if (nextTime > playbackEndCtx) playbackEndCtx = nextTime   // on every schedule
+if (streams.size === 0) scheduleIdle(playbackEndCtx)       // was: emit('idle', {})
+```
+
+`scheduleIdle` clamps its delay (computed remainder + 60 ms, with a 120 s hard
+ceiling) so a suspended AudioContext — a paused tab, an autoplay block, or our own
+pause — can never leave the UI believing she is still speaking. A gate that never
+reopens is worse than one that reopens early. `stop()` and `dispose()` clear the
+timer, and `stop()` still emits `stop` synchronously so a barge-in stays instant.
+
+### 3. Pause — the button did nothing for PCM even once visible
+
+```js
+try { player.paused ? player.audio.pause() : player.audio.play() } catch { }
+```
+
+With no `<audio>` element there was nothing to pause. PCM blocks are already booked
+into the future, and dropping buffers cannot silence them — the same reason the
+clamp path replaces the master gain node instead. Suspending the AudioContext is the
+only mechanism that holds back audio that has already been scheduled, so the PCM
+player gained `pause()` / `resume()` and `togglePause` now drives it:
+
+```js
+if (pcmStreaming && pcmStreaming.playing) {
+  if (player.paused) pcmStreaming.pause(); else pcmStreaming.resume()
+}
+```
+
+Resuming re-arms the end-of-playback notification against the resumed clock.
+
+### One more thing this exposed
+
+`announceSpeech` changed `player.speaking` but never told React, so consumers were
+not re-rendered when speaking began. The dock would not have appeared even with the
+visibility test fixed. `announceSpeech` now calls `playerChanged()`, which it should
+always have done — `speaking` is part of the snapshot the UI renders from.
+
+### Evidence
+
+`test/pcm-dock-controls.test.mjs` — 14 tests asserting all three fixes structurally
+against the built bundle, with the `scheduleIdle` clamp reproduced numerically so a
+regression in the arithmetic fails rather than merely changing a string. It also
+asserts the local.12 stall guard survives and the WAV path is untouched.
+
+Full suite: **196 tests, 0 failures** (182 before this change).
+
+### Note on the release
+
+`0.4.16-local.12` remains correct for everything it was promoted for: the transport,
+the stall-guard fix, and all the acoustic evidence. This change is client-only — no
+host module, no transport, no timing of the audio path itself. `lib/pcm-stream.js`,
+the SSE framing, the server-side behaviour and the adaptive first-chunk cutter are
+untouched.
+
+### How it was verified
+
+Structural tests alone would not have shown the controls reappearing, so the fix was
+checked in a real browser on the isolated scratch arm, against the pre-fix build as a
+control. Same arm, same prompt, same 10-second passage:
+
+| | pre-fix `.12` client | fixed `.13` client |
+|---|---|---|
+| dock sampled | 1151 times | 18 times |
+| **pause control present** | **0 samples** | **8 samples** |
+| **stop control present** | **0 samples** | **8 samples** |
+| persisted, not flashed | — | ~1805 ms of continuous presence |
+| pause → toggles to "Resume speech" (`▶`) | n/a — absent | **pass** |
+| resume → toggles back to "Pause" (`❚❚`) | n/a — absent | **pass** |
+| stop → clears the dock entirely | n/a — absent | **pass** |
+| PCM played | 3 records | 3 records |
+
+The pre-fix build reproduces the reported symptom exactly: the controls never
+rendered, once, in 1151 samples, while PCM audio was definitely playing. The fixed
+build renders them and they respond.
+
+**On underruns in that harness:** the scratch arm reported 1–2 underruns on its first
+PCM piece in *both* builds (`.12`: 1, `.13`: 2), so they are not caused by this
+change. That arm runs the local model concurrently on the same GPU and its first-TTS-byte
+was 142 ms against production's 42–70 ms — a contended environment. Production
+measurement stands at 0 underruns across 43 pieces, and the soak at 0 across 68. The
+`suspend()`-based pause does not touch scheduling or the gap detector.
