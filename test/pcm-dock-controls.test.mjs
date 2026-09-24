@@ -137,7 +137,8 @@ test('a speaking edge re-renders its consumers', () => {
 })
 
 test('the built bundle carries all of it', () => {
-  for (const needle of ['get playing()', 'playbackEndCtx', 'scheduleIdle', 'pcmPlaying', 'pcmStreaming.pause()']) {
+  for (const needle of ['get playing()', 'playbackEndCtx', 'scheduleIdle', 'pcmPlaying', 'pcmStreaming.pause()',
+                        'conversation.input.left', "pcmStop('silence')"]) {
     assert.ok(code.includes(needle), `the built client bundle must contain ${needle}`)
   }
 })
@@ -148,4 +149,134 @@ test('no PCM source was disturbed by this fix beyond the dock wiring', () => {
   assert.match(pcmCode, /STALL_START_MS/, 'and keep its two-budget form')
   // WAV playback must be untouched.
   assert.match(playerCode, /createObjectURL/, 'the WAV path must still build blob URLs')
+})
+
+// ── 4. the end-of-speech event has to be DELIVERED, not merely emitted ───────
+//
+// Reported from real use, after local.13: "the controls show up, but when you stop
+// speaking they don't disappear anymore. They stay at this kind of strange place."
+//
+// Cause: `emit('idle', {})` — and `emit('stop', …)` — carry NO streamId, because
+// they describe the whole audio graph rather than one stream. pcmEvent looked the
+// per-stream record up FIRST and returned when it found none, so the
+// `announceSpeech(false)` branch underneath was UNREACHABLE. The flag had been
+// stuck since the idle event was introduced; it only became visible in local.13,
+// when the dock started consulting `speaking` to decide whether to render at all.
+//
+// It was never only cosmetic: dsh-voice gates the MICROPHONE on the same edge
+// (`dsh:tts:stop` → isTtsSpeaking, client.js:534-540 / 1340), so the mic stayed
+// muted after the first PCM reply and the user could be talked over.
+//
+// The load-bearing test is behavioural — it lifts the SHIPPED pcmEvent out of the
+// built bundle and runs it with stubs — because a string assertion cannot tell
+// "handled before the lookup" from "written below an unconditional return".
+
+/** Pull one top-level function out of comment-stripped source by brace matching. */
+function extractFunction(src, name) {
+  const at = src.indexOf(`function ${name}(`)
+  assert.ok(at >= 0, `function ${name} must exist in the built bundle`)
+  let depth = 0
+  for (let i = src.indexOf('{', at); i < src.length; i++) {
+    if (src[i] === '{') depth += 1
+    else if (src[i] === '}') {
+      depth -= 1
+      if (depth === 0) return src.slice(at, i + 1)
+    }
+  }
+  throw new Error(`unbalanced braces while extracting ${name}`)
+}
+
+/** Load the shipped pcmEvent with stubs and record what it told the player. */
+function loadPcmEvent() {
+  const calls = []
+  const records = new Map([['s1', { streamId: 's1', t0Wall: 1000 }]])
+  const fn = new Function(
+    'pcmStreams', 'announceSpeech', 'pcmStreaming', 'pcmReport', 'sseDiag', 'pcm',
+    `${extractFunction(code, 'pcmEvent')}; return pcmEvent`,
+  )(
+    records,
+    (on) => calls.push(on),
+    { context: null, stats: {} },
+    (rec) => calls.push('report:' + rec.streamId),
+    {},
+    { telemetry: false },
+  )
+  return { fn, calls }
+}
+
+test('idle and stop reach announceSpeech even though they carry no streamId', () => {
+  const { fn, calls } = loadPcmEvent()
+  // Exactly the shape the player emits: emit('idle', {}) / emit('stop', {reason}).
+  fn('idle', {})
+  fn('stop', { reason: 'stop-playback' })
+  assert.deepEqual(calls, [false, false],
+    'both graph-wide events must clear the speaking flag — an early record lookup swallows them')
+})
+
+test('the graph-wide branch sits before the lookup, in the shipped function', () => {
+  const source = extractFunction(code, 'pcmEvent')
+  const handled = source.indexOf('announceSpeech(false)')
+  const lookup = source.indexOf('pcmStreams.get(')
+  assert.ok(handled >= 0, 'idle/stop must be handled in pcmEvent')
+  assert.ok(lookup >= 0, 'the per-stream path must still exist')
+  assert.ok(handled < lookup, 'handling must precede the lookup, which returns early on an unknown stream')
+  assert.doesNotMatch(source, /else if \(kind === 'idle'/,
+    'the unreachable branch must be gone rather than left behind')
+})
+
+test('per-stream events still route through the record lookup', () => {
+  const { fn, calls } = loadPcmEvent()
+  fn('scheduled', { streamId: 's1', piece: 1 })
+  assert.deepEqual(calls, [true], 'a scheduled stream still announces that she is speaking')
+  fn('scheduled', { streamId: 'unknown' })
+  fn('finished', { streamId: 'unknown' })
+  assert.deepEqual(calls, [true], 'an unknown stream is neither a reason to speak nor to report')
+})
+
+test('a finished stream still reports, so telemetry did not regress', () => {
+  const { fn, calls } = loadPcmEvent()
+  fn('finished', { streamId: 's1', underruns: 0, lateBlocks: 0, seqErrors: 0, dropped: 0 })
+  assert.deepEqual(calls, ['report:s1'], 'the per-stream branch must be untouched by the reordering')
+})
+
+test('an abort that empties the graph still arms the end-of-playback notification', () => {
+  const m = pcmCode.match(/handleAbort\(meta\) \{[\s\S]*?\n        \},/)
+  assert.ok(m, 'handleAbort must exist')
+  assert.match(m[0], /if \(streams\.size === 0\) scheduleIdle\(playbackEndCtx\)/,
+    'a cancelled reply is otherwise the last event it ever has, and the controls never retract')
+})
+
+test('with speech ended the dock expression is false, so it unmounts', () => {
+  const expr = dockCode.match(/const active = ([^\n]+)/)[1]
+  const active = new Function('p', `return (${expr})`)
+  const idle = { audio: null, queue: [], busy: false, speaking: false, pcmPlaying: false }
+  assert.equal(active(idle), false, 'this is the regression: idle must hide the controls')
+  assert.equal(active({ ...idle, speaking: true }), true, 'while she speaks they must be shown')
+  assert.equal(active({ ...idle, pcmPlaying: true }), true, 'including the scheduled-but-unplayed tail')
+})
+
+// ── 5. she must not talk over the user ───────────────────────────────────────
+//
+// Reported from real use: "you start talking when I'm talking… you kind of burst
+// in." bargeInNow() decided with WAV-path evidence plus `activeStreams`, which
+// counts streams still RECEIVING BYTES. The producer runs ~7x real time, so by the
+// time the user speaks `activeStreams` is usually already 0 while a second or more
+// of audio sits scheduled in the AudioContext — the guard returned early,
+// stopPlayback() never ran, and the tail played over him. dsh-voice's own
+// triggerBargeIn() cannot compensate: it pauses <audio> elements, and progressive
+// PCM creates none.
+test('barge-in stops scheduled PCM, not only bytes still arriving', () => {
+  const m = playerCode.match(/function bargeInNow\(\) \{[\s\S]*?\n    \}/)
+  assert.ok(m, 'bargeInNow must exist')
+  assert.match(m[0], /pcmStreaming\.activeStreams === 0/, 'the byte-arrival term must stay')
+  assert.match(m[0], /pcmStreaming\.playing/,
+    'scheduled-but-unplayed audio must count, or the guard returns early and she talks over the user')
+})
+
+test('silent mode reaches the PCM graph, not only future playback', () => {
+  const m = playerCode.match(/const wasEnabled = player\.enabled[\s\S]{0,500}?pcmStop\('silence'\)/)
+  assert.ok(m, 'the enabled edge must stop the PCM graph')
+  // The host cannot finish the job: aborting a stream stops bytes, not blocks
+  // already booked into the AudioContext.
+  assert.match(m[0], /!player\.enabled && wasEnabled/, 'only on the falling edge, so speech still starts')
 })

@@ -821,3 +821,144 @@ change. That arm runs the local model concurrently on the same GPU and its first
 was 142 ms against production's 42–70 ms — a contended environment. Production
 measurement stands at 0 underruns across 43 pieces, and the soak at 0 across 68. The
 `suspend()`-based pause does not touch scheduling or the gap detector.
+
+## 0.4.16-local.14 — the end of speech was never announced, and barge-in could not hear it
+
+Two reports from real use, one area of the client:
+
+> "The controls show up, but when you stop speaking they don't disappear anymore. They
+> stay at this kind of strange place."
+
+> "When I'm talking, you're not supposed to speak… you kind of burst in."
+
+Both are the same class of mistake: a value that exists, is correct, and is never
+delivered. `.13` taught the dock to *ask* the right question (`speaking`,
+`pcmPlaying`) without checking that anything ever changed the answer.
+
+### 1. `pcmEvent` dropped every graph-wide event
+
+`idle` and `stop` describe the whole audio graph, not one stream, so they carry no
+`streamId` — `emit('idle', {})`, `emit('stop', { reason })`. `pcmEvent` began:
+
+```js
+const rec = data && data.streamId ? pcmStreams.get(data.streamId) : null
+if (!rec) return
+```
+
+so both events returned before reaching:
+
+```js
+} else if (kind === 'idle' || kind === 'stop') { announceSpeech(false) }
+```
+
+That branch was **unreachable for as long as it existed**. `player.speaking` was set
+true on every `scheduled` event and never set false again, so it stayed true for the
+rest of the page's life after the first PCM reply.
+
+Under `.12` this was invisible: nothing consulted `speaking`. `.13` made the dock
+render from it, which is why the controls appeared and then never retracted — the
+fault was pre-existing, and `.13` is only what made it observable.
+
+**It was never only cosmetic.** dsh-voice gates the microphone on the same edge:
+
+| `lib/client.js` (dsh-voice) | |
+|---|---|
+| 534–538 | `dsh:tts:start` → `isTtsSpeaking: true`, `dsh:tts:stop` → `false` |
+| 1340 | `startRecording` reads `isTtsSpeaking` for gated turn-taking |
+
+`announceSpeech(false)` also dispatches `dsh:tts:stop`, so with the event swallowed
+the voice plugin went on believing the assistant was speaking after she had stopped,
+and its gate never reopened. The fix is the ordering: handle the graph-wide kinds
+*before* the per-stream lookup, since they are the events that have no record by
+definition.
+
+### 2. `bargeInNow()` decided from bytes instead of sound
+
+```js
+if (!player.audio && !player.queue.length && !player.busy && pcmStreaming.activeStreams === 0) return
+stopPlayback()
+```
+
+`activeStreams` counts streams still **receiving bytes**. The producer runs several
+times faster than real time, so by the time a listener reacts and speaks,
+`activeStreams` is usually already `0` while a second or more of speech sits booked
+into the AudioContext. The guard returned early, `stopPlayback()` never ran, and the
+already-scheduled tail played on over the user.
+
+dsh-voice's own barge-in could not cover for it either: `triggerBargeIn()` dispatches
+`dsh:tts:cancel` (which reaches the same broken guard) and pauses `<audio>` elements —
+of which progressive PCM creates none.
+
+`pcmStreaming.playing` is the term that answers "is there still sound to come", the
+same one the dock uses. Adding it means the decision to stop is made on audibility
+rather than on byte arrival.
+
+### 3. The controls were in the wrong kind of seat
+
+Reported separately:
+
+> "Can you place them in a better spot? Because right now they can't [be] on the left
+> side of the window."
+
+They were registered into `conversation.input.dock`, which the framework documents as
+*"full-width entries above the composer card"* — a strip whose other occupants
+(QueueDock, TodoDock, GoalDock) are full-width bars. Three compact buttons in a bar
+seat is why they looked like they had landed somewhere strange.
+
+`conversation.input.left` is documented as *"compact controls at the left of the
+composer tool row"* and had **no occupants**, so it is both the intended seat for this
+shape of control and a free one. Measured in the browser afterwards: the control
+cluster renders inside `…_tools` → `…_row` → `…_card`, 11 px wide, 23 px from the
+bottom of the viewport, at 29 % across its row. When the controls appear is unchanged —
+only where.
+
+### 4. Silent mode's audible tail (found while reading the same code)
+
+The host honours silent mode the instant it changes (`speakPiece` returns before the
+provider chain is entered; `setSpeechMuted` → `silenceNow` aborts what is in flight).
+What aborting a stream cannot do is remove blocks **already booked into the
+AudioContext** — the same asymmetry as §2, on the mute path. The browser now stops the
+PCM graph on the falling edge of `player.enabled`, so "nobody is listening" is true of
+the sound as well as of the next synthesis request.
+
+### Evidence
+
+`test/pcm-dock-controls.test.mjs` grows to 22 tests. The load-bearing ones are
+**behavioural, not textual**: `pcmEvent` is extracted from the built bundle by brace
+matching and executed against stubs, because no string assertion can tell "handled
+before the lookup" from "written below an unconditional return". The rest reproduce the
+dock's visibility expression, the abort path's idle re-arming, and both barge-in
+entry points.
+
+Full suite: **204 tests, 0 failures** (196 before this change).
+
+Browser verification on the isolated scratch arm (`dock-retract-check.mjs`), with the
+page instrumented *before* the app loads so the audio graph under test is the one
+observed:
+
+| measurement | result |
+|---|---|
+| controls appear while PCM speaks | pass |
+| **controls retract when she stops speaking on her own** | **gone 210 ms after the last sighting** |
+| `dsh:tts:start` → `dsh:tts:stop` | 1 → 1 (the mic gate's edge, previously never fired) |
+| barge-in: `AudioBufferSourceNode.stop()` calls | **0 → 1** (scheduled-but-unplayed audio cancelled) |
+| controls retract on barge-in | 0 ms after the synthetic voice-start |
+| seat | `…_tools` row, 11 px control, 23 px above the viewport bottom, leftFraction 0.294 |
+| PCM health | 4 records, `seqErrors` 0, `lateChunks` 0 |
+
+The one non-pass in that run is 2 underruns on the scratch arm's *first* piece — the
+same arm artifact documented above for `.12` and `.13` (it runs a local model on the
+same GPU), not a regression: nothing in this change touches scheduling.
+
+### Note on the release
+
+Client-only, again: no host module, no transport, no framing, no timing of the audio
+path. `lib/pcm-stream.js`, `lib/routes.js`, `lib/providers*`, `lib/live.js` and
+`lib/index.js` are byte-identical to `.13`, and `lib/live.js` remains identical to
+`local.10` — still the proof that the adaptive first-chunk cutter is untouched.
+
+### How it was verified
+
+`node voice-pcm/probe/dock-retract-check.mjs` against the scratch arm on `.14`.
+Structural tests alone could not have caught either defect: §1 is a control-flow
+property of shipped code, and §3 is a layout property of the running UI.
