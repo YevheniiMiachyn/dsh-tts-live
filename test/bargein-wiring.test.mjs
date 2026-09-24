@@ -32,8 +32,23 @@ function bodyOf(name) {
 const count = (needle) => code.split(needle).length - 1
 
 test('the player publishes playback state on both edges', () => {
-  assert.equal(count('announceSpeech(true)'), 1, 'exactly one place starts playback')
-  assert.equal(count('announceSpeech(false)'), 2, 'stopPlayback and the drained queue both end it')
+  // There are now TWO playback paths, and each must publish the state dsh-voice
+  // gates turn-taking on: the <audio> element (the WAV path, 0.4.16-local.4) and
+  // the progressive PCM scheduler (the PCM stage). Counting is therefore a
+  // count of paths, not of one call — but a path that forgets to announce still
+  // fails here, which is the invariant worth keeping.
+  assert.equal(count('announceSpeech(true)'), 2, 'the WAV element and the PCM scheduler each start playback')
+  assert.match(
+    code,
+    /audio\.play\(\)\.then\(\(\) => \{[\s\S]{0,120}announceSpeech\(true\)/,
+    'the WAV path announces the start on the play() promise',
+  )
+  assert.match(
+    code,
+    /rec\.p6 = rel\(\)[\s\S]{0,240}announceSpeech\(true\)/,
+    'the PCM path announces the start when its first block is scheduled',
+  )
+  assert.equal(count('announceSpeech(false)'), 3, 'stopPlayback, the drained queue, and the PCM idle/stop edge all end it')
   // The declaration itself matches `function announceSpeech(on)`, so the call counts
   // above cannot be satisfied by it.
   assert.match(code, /function announceSpeech\(on\)/)

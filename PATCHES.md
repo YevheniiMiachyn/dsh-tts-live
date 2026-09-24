@@ -480,3 +480,132 @@ with whisper.cpp: 12/12 clean, 80-100 % word match, every cut on a whole word wi
 no clipped token.
 
 Full suite: 150 tests, 0 failures.
+
+---
+
+## 0.4.16-local.11 — PCM streaming transport (experimental)
+
+The WAV path requires the complete utterance at five separate points: the TTS
+server will not emit a byte until synthesis finishes, DSH buffers the whole body,
+base64s it whole, the queue row holds that string, and the browser needs a complete
+Blob before an `<audio>` element can play. Measured, this is a **median 546 ms**
+floor before the browser even receives a payload, for a sentence whose audio is
+under four seconds.
+
+This release adds a second transport that removes the buffering without touching
+anything the previous stages validated. It is **OFF by default**:
+
+```yaml
+dsh-tts:
+  pcmStreamingExperimental: true   # default false
+  pcmStartupMs: 120                # default 120
+  pcmTelemetry: true               # default true
+```
+
+### What is carried, and how
+
+`response_format: "pcm"` on the OpenAI-compatible endpoint, read as it arrives
+rather than through `res.arrayBuffer()`. On qwentts.cpp that switches the server's
+own pipeline too: the codec decode becomes the per-frame streaming path and the
+body becomes a chunked `audio/pcm` stream whose first bytes exist ~45 ms after the
+request instead of after the whole utterance.
+
+Format, proven against the running server rather than assumed: **s16le, 16-bit,
+24000 Hz, mono, little-endian**, `audio/pcm`, chunked transfer, no Nagle
+(`set_tcp_nodelay`). Chunks are codec-frame aligned at 3840 bytes = 1920 samples =
+**80 ms**, ramping 1/2/4/8 frames and then holding at 640 ms.
+
+Framing over the existing `/dsh-tts/stream` SSE channel, metadata sent once at
+stream start:
+
+```
+pcm-start  { streamId, id, piece, sessionId, sampleRate, channels, format, t0Wall }
+pcm-chunk  { streamId, seq, data }        data = base64 of raw s16le
+pcm-end    { streamId, seq, bytes }
+pcm-abort  { streamId, reason, started }
+```
+
+It was already a push channel carrying a piece-ordered contract, and one connection
+serves both chimes and audio. `t0Wall` is the host's `Date.now()` at the request,
+which is what lets the browser express its marks on the host's timeline and makes
+P0 → P7 a single end-to-end number.
+
+### Browser playback
+
+WebAudio with one `AudioBufferSourceNode` per arriving chunk, chained on a single
+future-time cursor. **Not** AudioWorklet and not a ring buffer: the producer runs
+several times faster than real time (measured 4.1 s of audio delivered in 0.55 s),
+so a consumer that far behind does not need sample-accurate continuity machinery.
+Piece ordering is preserved by scheduling the lowest piece number first and by a
+single cursor, which is the same rule `insertInOrder()` applies on the host.
+
+The AudioContext is created **at the stream's own 24000 Hz**, so no chunk is
+resampled individually — per-buffer resampling is exactly the "click between
+chunks" failure — and the single resample to the device rate happens once on the
+final mix.
+
+`pcmStartupMs` of audio is buffered before playback begins. Below that the
+scheduler is racing the render thread; 120 ms is one and a half 80 ms frames.
+
+### WAV is not removed
+
+- A failure **before** any audio reaches the browser falls back to the validated
+  WAV path for that piece, and the fallback is logged.
+- A failure **after** the first chunk ends the piece instead of restarting it: a
+  mid-utterance format switch would speak the beginning twice, in two voices.
+
+`runPiece()` owns that contract through a single `committed` flag.
+
+### Two prerequisites this exposed
+
+Both were pre-existing and both are fixed, because chunked audio cannot survive
+either:
+
+1. **`connectSseStream()` reopened the connection on every poll.** `pollPending()`
+   calls it every 150 ms and the implementation closed and reopened the
+   `EventSource` unconditionally — ~7 reconnects a second. Nothing noticed while
+   the channel carried only an occasional chime; with audio on it, an event in
+   flight is 80-640 ms of speech. Measured before the fix: 37 and 115 connects in
+   single-reply runs, one stream 30720 bytes short with a sequence gap, and one
+   stream whose `pcm-end` never arrived. It is now idempotent; connects stay at 1.
+2. **`performance.memory`-scale telemetry coercion.** `Number(null) === 0`, so an
+   absent mark was reported as a 0 ms mark — which reads as instant.
+
+### Measurements
+
+Same instance, same voice, same sampler, same text, mode switched through
+`/dsh-tts/config`; 5 repetitions per arm.
+
+| | WAV (P0→W7b) | PCM (P0→P7 signal) |
+| --- | --- | --- |
+| idle, median | 704 ms | **91.3 ms** |
+| idle, p95 | 768 ms | **93.6 ms** |
+| concurrent local-LLM load, median | 732 ms | **90.2 ms** |
+| underruns | 0 | **0** |
+| byte-exact streams | 5/5 | **5/5** |
+
+Improvement: **≈ 641 ms, 87.7 %** — and it survives GPU contention unchanged
+(p95 96.7 ms idle → 121.8 ms under load, median unchanged).
+
+One finding worth recording: qwentts.cpp sometimes emits **400-500 ms of
+near-silence** before speech (envelope 4-8 of 32767, about -78 dBFS). That delay is
+in the audio, not in the transport, and it affects both paths equally, so the tap
+reports two marks: `first-signal` (any non-zero sample — the transport number) and
+`first-audio` (above -60 dBFS — the first thing a listener would call sound). They
+are never merged.
+
+Repeated turns: 20 consecutive streams, 19 fully measured, **0 underruns, 0
+sequence errors, 0 SSE reconnects, and the browser JS heap went 52.30 MB → 50.02 MB**
+— no growth proportional to what has been played.
+
+Cancellation: the stream is aborted (`cancelled: true`), the TTS fetch is closed so
+the server stops generating, the host has nothing open **61-76 ms** after the
+barge-in, the browser publishes its `start` → `stop` edge, and nothing is opened
+afterwards.
+
+Full suite: **173 tests, 0 failures** (150 before this stage, 23 new).
+
+### Status
+
+The transport is validated but the flag stays **off**: this stage's job was to
+produce the evidence and the switch, not to move the default.
