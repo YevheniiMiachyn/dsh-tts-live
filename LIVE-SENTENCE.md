@@ -141,21 +141,66 @@ regex needs the closing fence, so half a fence would be read aloud. A closed
 fence is scrubbed by `stripForSpeech` into the usual `code block, N lines`
 notice.
 
+## The FIRST piece may start at a clause boundary (0.4.16-local.10)
+
+Sentence-only cutting has one blind spot that costs real time: the first piece is
+the only piece whose length is paid for in **time to first audio**, and a reply
+that opens with a 200-character sentence pays for all of it. `liveMinCharsFirst:
+12` bought nothing there — twelve characters passed within half a second and the
+cutter then waited ~9 s more for the full stop.
+
+`scanBoundaries()` now returns two ascending lists from one walk — sentence ends
+and **clause ends** (`;` `:` `,` and the em/en dash, each followed by a space,
+outside fences and balanced backticks) — and `chooseCut()` applies them
+differently to the first piece than to every later one:
+
+| piece | rule |
+|---|---|
+| **first** of a step | a sentence end at or past `liveMinCharsFirst`; else a clause end at or past **48**; else a word boundary at or before **72** |
+| every later piece | a sentence end at or past `liveMinChars`, unchanged |
+
+A clause end must clear 48 characters because a comma typed at character 30 is
+not a reason to speak 30 characters; the piece keeps growing until the floor is
+met. The word fallback is the other way round — it takes the last whole word that
+still fits, because its whole job is to stop the piece growing — and its floor is
+`liveMinCharsFirst`, not 72, so a long word cannot push it back to the sentence
+end.
+
+48 is deliberately **`LIVE_DEFAULTS.minChars`**, the project's existing
+"shorter than this is not worth starting" line, so no new knob and no new
+semantic is introduced; 72 is a named constant in `lib/live.js`. Neither is
+config: an independent number would make the two live minimums mean something
+other than what they are named.
+
+Measured across 484 reply openings in real production sessions, the first
+sentence terminator sits at p50 = 63 and p75 = 94 characters, so this is a tail
+fix rather than the normal path — which is what keeps the later pieces
+sentence-shaped.
+
+`{`/`(`/`[` and markdown punctuation in front of a comma, and any comma with no
+space after it (`1,234`, `3,14`, `state-of-the-art`), are rejected as boundaries.
+
 ## Minimum-fragment policy
 
 Two thresholds, because the first piece and later pieces have opposite costs:
 
 * `liveMinCharsFirst` (default **12**) — the first piece's only job is to start
-  audio, so it is allowed to be short.
+  audio, so it is allowed to be short. It is the floor for *every* boundary class
+  the first piece may use, including the word fallback.
 * `liveMinChars` (default **48**) — later pieces are already overlapped by
   playback, so batching them is free and avoids synthesis churn.
 
-A candidate piece shorter than the applicable minimum is joined with the next
-sentence instead of being spoken alone. Measured against the existing
-`sentenceChars: 320`, upstream's own minimum is `min(60, 320/3) = 60`, which
-makes a first piece wait for ~60 characters — wrong for a latency feature, right
-for later pieces. `12 / 48` keeps the upstream spirit while prioritising the
-first sound. `liveMinCharsFirst: 3` reproduces "speak `Sure.` immediately".
+A boundary that is *earlier* than the minimum it is measured against is not a
+cut: the piece keeps growing and the next boundary that clears the floor is used.
+For later pieces that means a short sentence is joined with the next one; for the
+first piece it means the sentence end, the clause end and the word fallback each
+have their own floor (12 / 48 / 72) and the first one to arrive wins.
+
+Measured against the existing `sentenceChars: 320`, upstream's own minimum is
+`min(60, 320/3) = 60`, which makes a first piece wait for ~60 characters — wrong
+for a latency feature, right for later pieces. `12 / 48` keeps the upstream
+spirit while prioritising the first sound. `liveMinCharsFirst: 3` reproduces
+"speak `Sure.` immediately" and drops the first piece's floors to 3, 48 and 72.
 
 Over-long text is never held: once a window reaches `liveMaxChars`
 (`0` ⇒ `sentenceChars`), it is force-cut at the last word boundary, so a
@@ -189,12 +234,16 @@ and no TTS streaming mode is touched.
 ```yaml
 dsh-tts:
   liveSentenceStreaming: true   # master switch, default false
-  liveMinCharsFirst: 12         # first piece minimum
-  liveMinChars: 48              # later pieces minimum
+  liveMinCharsFirst: 12         # first piece minimum (also the word-fallback floor)
+  liveMinChars: 48              # later pieces minimum, and the first piece's clause floor
   liveMaxChars: 0               # 0 => sentenceChars
   livePollMs: 150               # browser pending-poll interval, live mode only
   liveFlushOnToolCall: true     # flush visible text when a tool call starts
 ```
+
+The first piece's clause floor (48) and word fallback (72) are constants in
+`lib/live.js`, not settings — see "The FIRST piece may start at a clause
+boundary" above for why.
 
 With `liveSentenceStreaming: false` the stream listener returns immediately:
 no cursor, no synthesis, no behaviour change — the durable path speaks whole
@@ -244,9 +293,13 @@ messages exactly as upstream does.
    it does not make synthesis faster while the local model generates. Measured
    route-A first-piece was ~3975 ms under contention vs ~530–580 ms isolated —
    that is the next experiment, not this one.
-5. **No mid-sentence clause cutting.** Only sentence boundaries (plus the
-   over-long force-cut) start audio; a reply whose first sentence is 200
-   characters long waits for it.
+5. **The clause floor is a character count, not a pause.** 48 characters of a
+   dense clause can still be a short thing to hear first (`"Honestly, Jenya, I
+   don't have a live view of your"`). It was chosen over a smaller floor because
+   the alternative is a 1–3 word fragment, and over a larger one because the
+   saving is proportional to how much sentence is skipped. Measured first-piece
+   transcriptions are clean at this floor; if it ever sounds clipped the
+   constant is `firstClauseChars()` in `lib/live.js`.
 
 ## Hook provenance (verified against dsh 0.1.5-rc.2)
 

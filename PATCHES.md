@@ -409,3 +409,74 @@ drops; and that an over-cap enqueue drains settled rows only and never takes a r
 suite: 117 tests, 0 failures.
 
 
+
+
+## `0.4.16-local.10` — the FIRST piece may start at a clause boundary
+
+Fixes the one blind spot sentence-only cutting cannot cover: the first spoken piece
+is the only piece whose length is paid for in **time to first audio**, and a reply
+that opens with a 200-character sentence paid for all of it. `liveMinCharsFirst: 12`
+bought nothing there — twelve characters passed within half a second and the cutter
+then waited ~9 s more for the full stop.
+
+Measured on the live pipeline (production `llama-server` stream, both cutters real,
+first piece synthesized on the real Qwen TTS server, 4 reply shapes x 3 repeats):
+mean first chunk **180.7 -> 55.8 characters**, so the TTS synthesis of that piece
+fell **1364 -> 524 ms** and first audible speech arrived **1921 ms earlier on
+average** (-11.6 %), with a clean 0 ms inter-piece gap and byte-exact text.
+
+### Change set
+
+| file | change |
+|---|---|
+| `lib/live.js` | `scanBoundaries()` returns sentence and clause ends from one walk; `chooseCut()` applies a first-piece-only policy ladder; `wordBoundaryBefore()` cuts *at or before* its cap |
+| `test/adaptive-first.test.mjs` | new, 33 tests |
+| `LIVE-SENTENCE.md` | the rule, the thresholds and the measured basis |
+| `package.json` | version, test list |
+
+### What it does
+
+- **`scanBoundaries(text)`** — one pass, two ascending lists. Clause punctuation is
+  `;` `:` `,` and the em/en dash, each accepted only when the next character is a
+  space, which rejects `1,234`, `3,14` and `state-of-the-art` without a rule of
+  their own, and only outside a fence and with balanced backticks. List/markdown
+  punctuation directly in front of the comma is rejected as structural.
+  `scanSafeCuts()` is kept as-is: it is exported and tested, and it is what the
+  sentence half of the walk is.
+- **`chooseCut(cursor, window, opts)`** — the cut decision, extracted from
+  `drainPieces()` so the claim bookkeeping and the boundary policy are separate
+  concerns. Later pieces keep the original sentence-only policy, so normal
+  chunking is untouched; only `cursor.pieces === 0` sees the ladder.
+- **`wordBoundaryBefore(text, at)`** — takes the last whole word at or before `at`.
+  The first version scanned to the end of the *look-ahead* window and handed out
+  pieces several times the fallback length; the existing over-long force-cut test
+  caught it before it left the fork.
+
+### Thresholds
+
+- first sentence end: `liveMinCharsFirst` (12) — unchanged.
+- first clause end: **48**, deliberately `LIVE_DEFAULTS.minChars`, the project's
+  existing "shorter than this is not worth starting" line, so no new knob and no
+  new semantic. A comma typed at character 30 is not a reason to speak 30
+  characters; the piece grows until the floor is met.
+- first word boundary: **72**, a constant in `lib/live.js`. A safety valve for an
+  opening with no punctuation inside its first sentence. Its floor is
+  `liveMinCharsFirst`, not 72, because its job is to stop the piece growing.
+
+Across 484 real reply openings in production sessions the first sentence terminator
+sits at p50 = 63 and p75 = 94 characters, so this is a tail fix rather than the
+normal path.
+
+### Text integrity
+
+The new boundary classes cut *at* the punctuation and claim exactly the same ranges
+as before, so the invariant is unchanged: every raw visible range of a step is
+claimed exactly once. `test/adaptive-first.test.mjs` asserts, for every case, that
+the concatenated pieces reconstruct the intended spoken text after the existing
+scrubber — no drop, no duplicate, no reorder — and separately that delta
+granularity (one character at a time, two halves, whole-word deltas) does not change
+the cut. First-piece transcriptions from the real voice server were re-recognized
+with whisper.cpp: 12/12 clean, 80-100 % word match, every cut on a whole word with
+no clipped token.
+
+Full suite: 150 tests, 0 failures.
