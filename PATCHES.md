@@ -279,3 +279,56 @@ runtime-only invariant) and that two `apply()` calls get independent state.
 
 `verify-parity.mjs`: all production patches intact.
 
+## Commit 8 — a cancellation is not a provider failure (0.4.16-local.7)
+
+### The defect, found while validating silent mode
+
+Live, on the production stack, a minute after muting: `speak_text` answered
+
+> TTS failed: all providers failed (custom: circuit open (cooldown))
+
+while the TTS server was demonstrably healthy — the `akeno` voice registered, and a direct
+request to `127.0.0.1:18080` returned a 96 KB WAV. The breaker snapshot held the explanation:
+
+| field | value |
+|---|---|
+| `failCount` | 3 |
+| `lastError` | `live-sentence: turn cancelled` |
+| `open` | true, ~60 s cooldown |
+
+Silent mode runs the same hard stop as a barge-in (`liveEngine.abortAll()`), so the in-flight
+synthesis of the reply before it — three pieces — was aborted. Each abort rejected *inside the
+provider wrapper*, which recorded it as a provider **failure**. Three of them reached the
+threshold and opened the circuit.
+
+User-visible consequence: **interrupting Akeno, or muting her, could silence her for a minute**,
+and during that minute nothing could be spoken at all. `stats.errors` counted them too — 7
+"errors" against 4 successes in the measured window, which reads as a failing provider rather
+than a working one.
+
+Correction to the record: the local.3 promotion notes stated "`stats.errors` counts barge-in
+cancellations; the breaker correctly ignores them (`failCount` stays 0)". It did not. Nothing in
+the code distinguished a cancellation from a failure; that claim was never true of this path.
+
+### The fix
+
+- **`lib/breaker.js`** — new `isCancellation(error)` (recognizes an `AbortError` name, or an
+  `abort`/`cancel` message, including a signal *reason*), and an exported `TIMEOUT_REASON`.
+- **`lib/index.js`**, **`lib/routes.js`** — our own synthesis timeout now aborts with
+  `new Error(TIMEOUT_REASON)`. That is what keeps the distinction decidable: an abort-family
+  error that is not the timeout is a cancellation, while a provider that accepts a request and
+  never answers is still a failure.
+- **The provider wrapper** records a failure only when `isCancellation()` says no — for thrown
+  errors *and* for `{ ok: false, reason }` results.
+
+### Regression coverage
+
+`test/breaker-cancel.test.mjs` (3 tests). The first drives three in-flight syntheses, mutes (the
+production trigger), and asserts `failCount 0` / circuit closed / the next turn synthesizes
+immediately. Negative-controlled: on the pre-fix code it fails with exactly the live signature —
+`failCount 3`, `lastError live-sentence: turn cancelled` — and the harness's held-open `fetch`
+stub honours the abort signal the way undici does, so the rejection is real.
+
+The two controls exist precisely because the fix makes failures *skip*: a genuine provider error
+(`ECONNREFUSED`) and a hung provider past `timeoutMs` must still open the circuit. Both do.
+
