@@ -332,3 +332,41 @@ stub honours the abort signal the way undici does, so the rejection is real.
 The two controls exist precisely because the fix makes failures *skip*: a genuine provider error
 (`ECONNREFUSED`) and a hung provider past `timeoutMs` must still open the circuit. Both do.
 
+
+## `0.4.16-local.8` — per-request sampler overrides
+
+Upstream sent no sampler parameters at all: the OpenAI-compatible body carried only `model`,
+`input`, `voice` and `response_format`, so how each sentence was drawn was left entirely to the
+endpoint. The local qwentts.cpp server defaults to temperature 0.9, top_k 50, top_p 1.0 and a
+**fresh random seed per request** on both the talker and the sub-talker — and the sub-talker is
+what draws the acoustic codes, i.e. timbre.
+
+### The change
+
+- **`lib/index.js`** — nine config keys: `samplingProviders` (default `[]`) plus eight values, each
+  defaulting to the `-1` "unset" sentinel.
+- **`lib/providers/cloud.js`** — `samplingFieldsFor(cfg, key)` maps config onto the wire names the
+  server parses and enforces its accepted ranges; the spread lands in the OpenAI-compatible body.
+  `samplingSignature(cfg)` is its cache-key counterpart.
+- **`lib/index.js`** — the signature joins the synthesis cache key and the in-flight key, via a
+  `keyFor()` that appends it only when sampling is configured. Both keys stay byte-identical to
+  upstream in the default configuration.
+
+### Why it ships inert
+
+Identity was measured with the repo's own speaker encoder rather than by ear: at default sampling
+the x-vector is 0.98 to the Akeno reference and 0.99 take-to-take, so there was no identity drift
+for a sampler change to fix. Tightening the sub-talker therefore buys nothing and is left off. The
+one setting that *does* move identity is greedy on the talker, which is catastrophic rather than
+subtle: 163.84 s runaways and 0.84 similarity. Details and the full measurement table: `SAMPLING.md`.
+
+### Regression coverage
+
+`test/sampling.test.mjs` (8 tests). The invariants asserted are the ones that matter operationally:
+byte-identical bodies with nothing configured, wire names when a provider is named, sentinels
+omitted rather than sent as `-1`, out-of-range values dropped instead of sent (a 4xx would fail the
+provider and, with one chain entry, silence her), no leakage into an unnamed provider, and
+signature emptiness/stability. `lib/client.js` is byte-identical to local.7 — this is a host-only
+release.
+
+
