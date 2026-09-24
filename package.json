@@ -42,7 +42,7 @@
     "url": "https://github.com/GooDAnDReaDY/dsh-tts/issues"
   },
   "scripts": {
-    "test": "node --test test/live.test.mjs test/wiring.test.mjs test/dup-publish.test.mjs test/bargein.test.mjs test/bargein-wiring.test.mjs test/spoken-code.test.mjs",
+    "test": "node --test test/live.test.mjs test/wiring.test.mjs test/dup-publish.test.mjs test/bargein.test.mjs test/bargein-wiring.test.mjs test/spoken-code.test.mjs test/silent-mode.test.mjs",
     "build:client": "node scripts/build-client.mjs",
     "pretest": "node scripts/build-client.mjs",
     "verify:parity": "node scripts/verify-parity.mjs"
