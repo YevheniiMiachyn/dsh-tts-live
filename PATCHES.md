@@ -196,3 +196,139 @@ four.
 `lib/client.js` is byte-identical to local.4 in this commit — the browser half is
 untouched, so the recorded client hash stays valid across both versions and only the
 host half changes.
+
+## Commit 7 — silent mode (0.4.16-local.6)
+
+### What it is for
+
+The stack speaks every reply. That is right when somebody is at the machine and wrong
+when nobody is: the TTS model is loaded beside the primary model on the same single
+GPU, so every spoken sentence is inference spent talking to an empty room.
+
+Silent mode is the switch that says *nobody is listening right now*. It is turned on by
+the agent when the user says he is going out or wants quiet, and off again when he is
+back.
+
+### Why it is a runtime flag and not a setting
+
+It was first written as a `speechMuted` field in the plugin config, persisted to
+`settings.yaml`. That was wrong, and the correction is the point of this commit:
+
+| | persisted setting | runtime flag (shipped) |
+|---|---|---|
+| meaning | how the stack is configured to behave | who is in the room for the next hour |
+| after a restart | silently still mute — the stack looks broken | speech is enabled; the profile decides |
+| failure mode | a forgotten mute outlives the reason for it | cannot outlive the process |
+
+So the state lives in one closure variable inside `apply()`, is never written to
+`settings.yaml`, and cannot be stored, restored or inherited. Every start begins with
+speech enabled and the profile's own `speakReplies` deciding whether replies are spoken
+at all. (It is deliberately *not* the same switch as `speakReplies`: that one is the
+standing preference, this one is a moment in time.)
+
+### The gate
+
+`lib/index.js`, one predicate consulted at three points:
+
+- **`speakPiece()`** — the single choke point every automatic path funnels through: the
+  live sentence flush, speak-as-it-goes, the settled remainder, turn-end pieces and
+  announcements. The return sits before the queue slot is reserved and before the
+  provider chain is entered, so *muted* means **no request reached the TTS provider**,
+  not merely *no audio came out*. Callers keep their own bookkeeping, which is why
+  unmuting mid-reply speaks only what has not been said yet instead of replaying the
+  reply from the start.
+- **`announce()`** — approval and question announcements, including their chimes. An
+  announcement exists to attract attention; silent mode means there is nobody to attract.
+- **the `speak_text` tool** — declines with `muted: true` rather than synthesizing and
+  discarding the audio, and says why, so a caller unmutes deliberately instead of
+  quietly failing to be heard.
+
+### Control surface
+
+- **`set_speech_output`** — the agent-facing tool (`{ muted, reason }`; called with no
+  argument it only reports). Turning silent mode **on** also calls the barge-in path
+  (`liveEngine.abortAll()`), because *nobody is listening* has to be true of the
+  sentence being read right now, not only of the next one.
+- **`POST /dsh-tts/silence`** (`{ muted }`, `GET` reports) — for a script, a shortcut or
+  a future UI button, so the switch does not depend on an agent being in the loop.
+- **`/dsh-tts/status`** — `speechMuted` (the runtime state) and `speechSuppressed`
+  (`speechMuted || !speakReplies`), so "silent because nobody is here" and "reply speech
+  is configured off" cannot be mistaken for each other.
+
+One setter (`setSpeechMuted`) backs the tool and the route, so they cannot drift apart.
+
+### Client
+
+`lib/client-src/20-player.js`, one line: `player.enabled` now also requires
+`!meta.speechMuted`. The muted browser therefore behaves exactly as it already does
+when reply speech is unchecked — no `/dsh-tts/pending` poll and no playback — instead of
+introducing a new client state to reason about. No new UI: the switch is the agent's and
+the route's, and the standing preference stays where it was.
+
+### Regression coverage
+
+`test/silent-mode.test.mjs` (10 tests) drives the real plugin under a fake Cordis
+context with `fetch` stubbed, so `calls` is an exact record of every synthesis attempt.
+Every muted assertion has an unmuted control driving the same turn, because a gate that
+blocked everything — or a harness that never reached the synthesizer — must fail rather
+than pass quietly. It also asserts the schema does **not** contain `speechMuted` (the
+runtime-only invariant) and that two `apply()` calls get independent state.
+
+`test/wiring.test.mjs` needed one update: it asserted that the *last* registered tool was
+`speak_text`, which a second tool invalidates. It now asserts both tools by name.
+
+`verify-parity.mjs`: all production patches intact.
+
+## Commit 8 — a cancellation is not a provider failure (0.4.16-local.7)
+
+### The defect, found while validating silent mode
+
+Live, on the production stack, a minute after muting: `speak_text` answered
+
+> TTS failed: all providers failed (custom: circuit open (cooldown))
+
+while the TTS server was demonstrably healthy — the `akeno` voice registered, and a direct
+request to `127.0.0.1:18080` returned a 96 KB WAV. The breaker snapshot held the explanation:
+
+| field | value |
+|---|---|
+| `failCount` | 3 |
+| `lastError` | `live-sentence: turn cancelled` |
+| `open` | true, ~60 s cooldown |
+
+Silent mode runs the same hard stop as a barge-in (`liveEngine.abortAll()`), so the in-flight
+synthesis of the reply before it — three pieces — was aborted. Each abort rejected *inside the
+provider wrapper*, which recorded it as a provider **failure**. Three of them reached the
+threshold and opened the circuit.
+
+User-visible consequence: **interrupting Akeno, or muting her, could silence her for a minute**,
+and during that minute nothing could be spoken at all. `stats.errors` counted them too — 7
+"errors" against 4 successes in the measured window, which reads as a failing provider rather
+than a working one.
+
+Correction to the record: the local.3 promotion notes stated "`stats.errors` counts barge-in
+cancellations; the breaker correctly ignores them (`failCount` stays 0)". It did not. Nothing in
+the code distinguished a cancellation from a failure; that claim was never true of this path.
+
+### The fix
+
+- **`lib/breaker.js`** — new `isCancellation(error)` (recognizes an `AbortError` name, or an
+  `abort`/`cancel` message, including a signal *reason*), and an exported `TIMEOUT_REASON`.
+- **`lib/index.js`**, **`lib/routes.js`** — our own synthesis timeout now aborts with
+  `new Error(TIMEOUT_REASON)`. That is what keeps the distinction decidable: an abort-family
+  error that is not the timeout is a cancellation, while a provider that accepts a request and
+  never answers is still a failure.
+- **The provider wrapper** records a failure only when `isCancellation()` says no — for thrown
+  errors *and* for `{ ok: false, reason }` results.
+
+### Regression coverage
+
+`test/breaker-cancel.test.mjs` (3 tests). The first drives three in-flight syntheses, mutes (the
+production trigger), and asserts `failCount 0` / circuit closed / the next turn synthesizes
+immediately. Negative-controlled: on the pre-fix code it fails with exactly the live signature —
+`failCount 3`, `lastError live-sentence: turn cancelled` — and the harness's held-open `fetch`
+stub honours the abort signal the way undici does, so the rejection is real.
+
+The two controls exist precisely because the fix makes failures *skip*: a genuine provider error
+(`ECONNREFUSED`) and a hung provider past `timeoutMs` must still open the circuit. Both do.
+
