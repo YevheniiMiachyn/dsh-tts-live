@@ -74,7 +74,15 @@ each piece independently, so prosody restarts at every piece boundary.
 
 `-1` is the "not configured" sentinel throughout and is omitted rather than sent.
 The endpoint's own seed default is already `-1`, so omitting it reproduces upstream
-behaviour exactly: **repeatability is one explicit non-negative seed away.**
+behaviour exactly.
+
+**Correction (2026-09-24).** An earlier draft of this document claimed that
+"repeatability is one explicit non-negative seed away". It is not, and the claim was
+falsified by measurement before it could mislead anyone: the same text with
+`seed: 4242` sent twice came back **4.16 s and 3.68 s**. The seed demonstrably
+influences generation — a different seed gives different audio — but qwentts.cpp
+advances an RNG sub-sequence per request, so identical seeds do **not** pin
+identical output. Nothing may rely on byte-identical audio from a fixed seed.
 
 The sampler also joins the synthesis cache key and the in-flight key
 (`samplingSignature`), because it is part of what produced the audio — without
@@ -82,20 +90,44 @@ that a take synthesized at one temperature could be served for another. The
 signature is `''` until sampling is configured, so both keys remain byte-identical
 to upstream by default.
 
+## Which knob does what — measured
+
+Identity was never the problem, so the second question was *delivery*. Four takes
+per arm, same 205-character passage, 2026-09-24:
+
+| arm | duration spread | spectral spread | cos to reference |
+|---|---|---|---|
+| endpoint defaults | 25.2% | 401 | 0.98 |
+| talker 0.8 / top_k 30 | 13.7% | 197 | 0.98 |
+| **talker 0.6 / top_k 20** | **5.6%** | 131 | 0.98 |
+| sub-talker 0.6 / 20 only | 17.9% | 116 | 0.98 |
+| talker 0.6/20 + sub 0.6/20 | 14.8% | ~127 | 0.98 |
+
+The **talker is the pacing knob** and the **sub-talker is the timbre knob**, and
+neither moves the person: identity stayed at 0.98 to the reference and 0.99
+take-to-take in every arm, including the defaults. That is the finding that
+matters — what an ear reports as "a slightly different voice" is pacing, not a
+different speaker.
+
+Honest limit: with n=4 the last two arms are inside the noise of each other, so
+their ranking is the ear's call, not this table's. Reproduce with
+`pacing-probe.ps1`.
+
 ## Configuration
 
 ```yaml
 dsh-tts:
   samplingProviders:
     - custom
-  # Talker: leave the endpoint default (or lower slightly to steady pacing).
-  samplingTemperature: 0.8
-  samplingTopK: 30
-  # Sub-talker: this is the timbre knob.
-  samplingSubtalkerTemperature: 0.7
+  # Talker: the PACING knob.
+  samplingTemperature: 0.6
+  samplingTopK: 20
+  # Sub-talker: the TIMBRE knob. It cuts spectral spread about 3x but barely
+  # touches pacing, so it is the first pair to relax if she sounds flattened.
+  samplingSubtalkerTemperature: 0.6
   samplingSubtalkerTopK: 20
-  # Reproducible audio for the same text when testing.
-  samplingSeed: 4242
+  # NOT a reproducibility switch - see the correction above.
+  samplingSeed: -1
 ```
 
 ## Verification
