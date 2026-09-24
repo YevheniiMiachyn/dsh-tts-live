@@ -113,6 +113,38 @@ Honest limit: with n=4 the last two arms are inside the noise of each other, so
 their ranking is the ear's call, not this table's. Reproduce with
 `pacing-probe.ps1`.
 
+## Confirmed by ear (2026-09-24)
+
+After promotion and a restart, with talker 0.6/20 + sub-talker 0.6/20 live, Jenya's
+verdict on a long reply: **"much better — like the same person, about the same pace,
+still natural, not mechanical, with intonation."** That closes the thread the table
+opened: steady delivery, unchanged speaker, and the ear agreed with the measurement
+rather than having to be argued with.
+
+## Emotion / style instructions are NOT available on this model
+
+Recorded so nobody spends an evening on it. `tools/tts-server.cpp:269` does accept an
+`instructions` field over HTTP and maps it to `qt_tts_params.instruct`, which looks
+like a per-request style dial — and it is unreachable here, because
+`src/qwen.cpp:634` rejects it outright:
+
+    if (params->instruct && mt == "base") qt_set_error("--instruct is not supported for base models");
+
+The Akeno model is `qwen-talker-1.7b-base-Q8_0`, model type `base`, so sending
+`instructions` would **fail the request rather than add warmth**. Style instructions
+need an instruct-capable or VoiceDesign model; for a VoiceDesign build they are
+required, not optional (`qwen.cpp:648`). So "make her sound more emotional sometimes"
+is not a setting on this model. The reachable expressiveness levers are:
+
+1. the **talker temperature** — the pace/emotion axis: 0.6 measured 5.6% duration
+   spread against 13.7% at 0.8, so more feeling costs pace consistency, measurably;
+2. **top_p**, still untouched at 1.0 — worth measuring beside a higher temperature,
+   since a nucleus can preserve variety that top_k 20 removes;
+3. the expressive glyphs already in the `removeRegex` diet (a heart produces a real
+   breathy vocalisation) — free, and already tuned;
+4. the **text itself**: punctuation and sentence rhythm are the only emotion control
+   that needs no settings change at all.
+
 ## Configuration
 
 ```yaml
